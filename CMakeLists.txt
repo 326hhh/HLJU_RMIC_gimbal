@@ -20,12 +20,12 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 set(GIMBAL_SOURCES
     src/protocol/zdt_frame.cpp
     src/transport/itransport.cpp
-    src/transport/uart_transport.cpp
     src/transport/can_transport.cpp
     src/device/zdt_motor.cpp
     src/gimbal/axis.cpp
     src/gimbal/gimbal.cpp
     src/link/udp_control_link.cpp
+    src/link/unified_serial.cpp
 )
 
 add_library(gimbal_core STATIC ${GIMBAL_SOURCES})
@@ -40,7 +40,7 @@ add_executable(gimbal src/main.cpp)
 target_link_libraries(gimbal PRIVATE gimbal_core)
 
 # ---------------------------------------------------------------------------
-# 自测（不需要真实硬件：--dry 走 FakeTransport）
+# 自测（纯软件自检：协议向量 + RxDemux 帧分流，不需要真实硬件）
 # ---------------------------------------------------------------------------
 enable_testing()
 add_test(NAME selftest COMMAND gimbal --selftest)

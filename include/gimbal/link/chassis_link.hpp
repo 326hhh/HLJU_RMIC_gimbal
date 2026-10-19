@@ -3,12 +3,16 @@
 //
 //  与下位机 UserLib/Comm/uart_link_config.h **逐字节一致**：
 //    命令帧（Jetson -> F407）12 B
-//    反馈帧（F407 -> Jetson）32 B
-//    CRC-8/ATM(poly=0x07, init=0)，100 Hz 双向
+//    反馈帧（F407 -> Jetson）40 B（v2：末尾含四轮实测转速）
+//    CRC-8/ATM(poly=0x07, init=0x00)，100 Hz 双向
 //
 //  ⚠️ 坐标约定跟随底盘库（docs/CHASSIS_LIBRARY.md §4）：
 //      +x = 车体前进，+y = 车体左移，wz 逆时针为正。
 //      **不是**旧 ChassisCommand 草案里的「vx 右 / vy 前」，那个已经废弃。
+//
+//  本文件只放：帧常量 / 数据结构 / 编解码纯函数 / IChassisLink 抽象 / 统计。
+//  UART 收发送在 `link/unified_serial.hpp`（与云台 ZDT 帧共用一条串口，
+//  一条 CH340 挂三块 MCU 时的单口链路）。
 //
 //  命令帧（12 B，小端）
 //  ┌──────┬────┬─────┬─────┬─────┬──────┬──────┬────────┬───────┬──────┐
@@ -29,20 +33,12 @@
 // ===========================================================================
 #pragma once
 
-#include <fcntl.h>
-#include <termios.h>
-#include <unistd.h>
-
-#include <cerrno>
-#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <iostream>
 #include <string>
-#include <vector>
 
-#include "gimbal/link/control_link.hpp"   // 复用 putU16/getI32 等小端读写
+#include "gimbal/link/control_link.hpp"   // 复用 putI16/getI32 等小端读写
 
 namespace gimbal {
 
@@ -192,232 +188,6 @@ struct ChassisLinkStats {
     uint64_t    reconnects = 0;
     double      age_s      = 999.0;
     std::string last_error;
-};
-
-// ---------------------------------------------------------------------------
-// UART 实现（真机用这个）
-// ---------------------------------------------------------------------------
-class UartChassisLink : public IChassisLink {
-public:
-    struct Config {
-        std::string device      = "/dev/ttyUSB1";
-        int         baud        = 115200;
-        double      tx_period_s = 0.005;  ///< 200 Hz 下发指令（10ms→5ms，降控制延迟）
-        /// 超过这么久没反馈 -> state().valid 置 0（不额外动作；停车靠 F407 看门狗）
-        double      timeout_s   = 0.3;
-    };
-
-    explicit UartChassisLink(Config c) : cfg_(std::move(c)) {}
-
-    ~UartChassisLink() override { close(); }
-
-    bool open() override {
-        close();
-        fd_ = ::open(cfg_.device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-        if (fd_ < 0) {
-            stats_.last_error = std::strerror(errno);
-            return false;
-        }
-        termios tio{};
-        if (tcgetattr(fd_, &tio) != 0) {
-            stats_.last_error = std::strerror(errno);
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        cfmakeraw(&tio);
-        tio.c_cflag |= (CLOCAL | CREAD);
-        tio.c_cflag &= ~(CSTOPB | PARENB | CRTSCTS);
-        tio.c_cflag = static_cast<tcflag_t>((tio.c_cflag & ~CSIZE) | CS8);
-        tio.c_cc[VMIN]  = 0;
-        tio.c_cc[VTIME] = 0;
-        const speed_t sp = (cfg_.baud == 921600) ? B921600
-                         : (cfg_.baud == 460800) ? B460800
-                         : (cfg_.baud == 230400) ? B230400
-                         : (cfg_.baud == 57600)  ? B57600
-                         : B115200;
-        cfsetispeed(&tio, sp);
-        cfsetospeed(&tio, sp);
-        if (tcsetattr(fd_, TCSANOW, &tio) != 0) {
-            stats_.last_error = std::strerror(errno);
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-        tcflush(fd_, TCIOFLUSH);
-        opened_ = true;
-        rx_buf_.clear();
-        const double now = nowS();
-        last_tx_s_   = now;
-        last_rx_s_   = now;
-        return true;
-    }
-
-    void close() override {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-        opened_ = false;
-        rx_buf_.clear();
-    }
-
-    bool isOpen() const override { return opened_ && fd_ >= 0; }
-
-    std::string name() const override { return "chassis-uart:" + cfg_.device; }
-
-    void setCommand(const ChassisCommand& c) override {
-        cmd_           = c;
-        clear_pending_ = clear_pending_ || c.clear_odom;
-    }
-
-    const ChassisState& state() const override { return state_; }
-
-    const ChassisLinkStats& stats() const { return stats_; }
-
-    void poll() override {
-        const double now = nowS();
-        if (fd_ < 0) {
-            /* 断线自动重连：限速 0.5 s 一次，别把 CPU 打满 */
-            if (now - last_open_try_s_ > 0.5) {
-                last_open_try_s_ = now;
-                if (open()) ++stats_.reconnects;
-            }
-            return;
-        }
-
-        /* ---- 收：非阻塞读到空为止 ---- */
-        uint8_t buf[256];
-        for (;;) {
-            const ssize_t n = ::read(fd_, buf, sizeof(buf));
-            if (n > 0) {
-                appendRx(buf, static_cast<size_t>(n));
-                parseRx(now);
-            } else {
-                break;
-            }
-        }
-
-        /* ---- 发：按 tx_period_s 节流 ---- */
-        if (now - last_tx_s_ >= cfg_.tx_period_s) {
-            last_tx_s_ = now;
-            sendCommand();
-        }
-
-        state_.age_s = now - last_rx_s_;
-        if (state_.age_s > cfg_.timeout_s) state_.valid = false;
-    }
-
-private:
-    static double nowS() {
-        return std::chrono::duration<double>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    }
-
-    void appendRx(const uint8_t* d, size_t n) { rx_buf_.insert(rx_buf_.end(), d, d + n); }
-
-    /// 从累积缓冲切帧：丢噪声、校验 CRC、更新状态
-    void parseRx(double now) {
-        size_t pos = 0;
-        while (rx_buf_.size() - pos >= CHASSIS_FB_LEN) {
-            if (rx_buf_[pos] != CHASSIS_FB_HEAD0 || rx_buf_[pos + 1] != CHASSIS_FB_HEAD1) {
-                ++pos;
-                ++stats_.sync_err;
-                continue;
-            }
-            ChassisState tmp;
-            if (!chassisDecodeFb(&rx_buf_[pos], tmp)) {
-                ++pos;
-                ++stats_.crc_err;
-                continue;
-            }
-            state_           = tmp;
-            state_.age_s     = 0.0;
-            last_rx_s_       = now;
-            ++stats_.rx_frames;
-            pos += CHASSIS_FB_LEN;
-        }
-        rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + static_cast<long>(pos));
-        /* 缓冲里残留半帧没问题；噪声太多时防无限增长 */
-        if (rx_buf_.size() > 4096) rx_buf_.clear();
-    }
-
-    void sendCommand() {
-        ChassisCommand c = cmd_;
-        if (clear_pending_) {
-            c.clear_odom   = true;
-            clear_pending_ = false;
-            c.estop        = false;
-            c.enable       = false;   // CLEAR 帧不动电机，EN 位无意义
-        }
-        if (c.estop) {                // 急停帧不带速度
-            c.vx_mmps   = 0.0;
-            c.vy_mmps   = 0.0;
-            c.wz_mradps = 0.0;
-        }
-        c.seq = tx_seq_++;
-
-        uint8_t frame[CHASSIS_CMD_LEN];
-        chassisEncodeCmd(frame, c);
-
-        const ssize_t n = ::write(fd_, frame, sizeof(frame));
-        if (n == static_cast<ssize_t>(sizeof(frame))) {
-            ++stats_.tx_frames;
-        } else {
-            ++stats_.tx_dropped;
-        }
-    }
-
-    Config               cfg_;
-    int                  fd_ = -1;
-    bool                 opened_ = false;
-    ChassisCommand       cmd_{};
-    ChassisState         state_{};
-    ChassisLinkStats     stats_{};
-    std::vector<uint8_t> rx_buf_;
-    bool                 clear_pending_ = false;
-    uint8_t              tx_seq_ = 0;
-    double               last_tx_s_ = 0.0;
-    double               last_rx_s_ = 0.0;
-    double               last_open_try_s_ = -1e9;
-};
-
-// ---------------------------------------------------------------------------
-// CAN 实现（SocketCAN，与云台 ZDT 共总线）—— **暂未实现**
-//
-// 为什么不做：上位机侧的 CAN 适配器（KCANBus-U-I）在 Linux 下不可用，
-// 方向整体暂停（docs/CHASSIS_LIBRARY.md §15.8 / §16.12）。
-// UART 链路通了之后回来填这个（接口与 UartChassisLink 完全一致）。
-// ---------------------------------------------------------------------------
-class CanChassisLink : public IChassisLink {
-public:
-    struct Config {
-        std::string iface   = "can0";
-        int         bitrate = 500000;
-    };
-
-    explicit CanChassisLink(Config c) : cfg_(std::move(c)) {}
-
-    bool open() override {
-        std::cerr << "[chassis-can] " << cfg_.iface << " @" << cfg_.bitrate
-                  << "bps —— 尚未实现（CAN 方向暂停，见文档 §15.8）\n";
-        opened_ = true;
-        return true;
-    }
-    void close() override { opened_ = false; }
-    bool isOpen() const override { return opened_; }
-    std::string name() const override { return "chassis-can:" + cfg_.iface; }
-
-    void setCommand(const ChassisCommand& c) override { cmd_ = c; }
-    const ChassisState& state() const override { return state_; }
-    void poll() override {}
-
-private:
-    Config         cfg_;
-    bool           opened_ = false;
-    ChassisCommand cmd_{};
-    ChassisState   state_{};
 };
 
 }  // namespace gimbal

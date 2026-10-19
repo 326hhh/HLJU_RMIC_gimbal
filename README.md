@@ -62,24 +62,56 @@ cmake --build build -j4
 ## 2. 目录结构
 
 ```
-gimbal/
-├── CMakeLists.txt
-├── include/gimbal/
-│   ├── protocol/
-│   │   ├── zdt_codes.hpp        功能码 / 返回码 / 状态位 / 固件类型
-│   │   └── zdt_frame.hpp        帧构造器 + 流式解析器
-│   ├── transport/
-│   │   ├── itransport.hpp       ★ 传输层抽象（节流队列 + 帧队列 + 统计）
-│   │   ├── uart_transport.hpp   UART 实现（热插拔自动重连）
-│   │   ├── can_transport.hpp    CAN 实现（SocketCAN，扩展帧拆包/重组）
-│   │   └── fake_transport.hpp   纯软件模拟电机（--dry / --selftest）
-│   ├── device/zdt_motor.hpp     单电机：使能/速度/位置/急停/遥测
+gimbal/                              21 个源文件 / 约 3300 行 + 2 份文档
+├── CMakeLists.txt                   构建脚本：gimbal_core 静态库 + gimbal / mjpeg_server 两个可执行
+├── README.md                        本文（概览 / 设计决策 / 踩坑）
+├── CHASSIS_LINK.md                  底盘链路 + 图传 + 无线连接 的使用与排障手册
+│
+├── include/gimbal/                  ── 头文件：接口与线协议 ──
+│   ├── protocol/                    ZDT（张大头）闭环步进电机线协议
+│   │   ├── zdt_codes.hpp            功能码 / 返回码 / 状态位 / 固件类型（Emm5.0 vs X 差异）
+│   │   └── zdt_frame.hpp            帧构造器声明 + 流式解析器（粘包/半包切帧）
+│   ├── transport/                   与总线无关的收发层（换总线只换这里）
+│   │   ├── itransport.hpp           ★ 抽象接口：12 ms 发送节流队列 + 收帧队列 + 统计 + 热插拔
+│   │   ├── uart_transport.hpp       UART 实现（termios 115200，断线自动重连）
+│   │   ├── can_transport.hpp        SocketCAN 实现（29-bit 扩展帧拆包重组，未上机验证）
+│   │   └── fake_transport.hpp       纯软件电机模拟（--dry / --selftest 用，无需硬件）
+│   ├── device/
+│   │   └── zdt_motor.hpp            单台电机：使能 / 速度 / 位置 / 急停 / 遥测轮询
 │   ├── gimbal/
-│   │   ├── axis.hpp             单轴：角速度斜坡 + 软限位 + 限位开关联动
-│   │   └── gimbal.hpp           双轴：统一时钟 + 两级看门狗
-│   └── link/chassis_link.hpp    ★ 底盘接口（UART/CAN 双实现占位）
-└── src/…                        对应实现 + main.cpp
+│   │   ├── axis.hpp                 单轴控制律：角速度斜坡 + 死区 + 软限位 + 回中 + 角度估计
+│   │   └── gimbal.hpp               双轴协调：统一时钟 + 两级看门狗 + 传输层 poll 去重
+│   └── link/                        ── 通信链路（对上层 / 对下位机）──
+│       ├── control_link.hpp         ★ UDP 线协议 v2：上行 24 B / 下行 64 B，小端编解码 + 校验和
+│       ├── udp_control_link.hpp     UDP 收发实现：非阻塞 socket、按频率回发遥测、丢包统计
+│       └── chassis_link.hpp         ★ 底盘链路：F407 USART2 协议（命令 12 B / 反馈 40 B）
+│                                    + UartChassisLink（termios + 非阻塞 + 自动重连 + 100/200 Hz 节流）
+│
+└── src/                             ── 实现 ──
+    ├── main.cpp                     入口：参数解析 / 100 Hz 主循环 / 本地 stdin 命令 / 自检 / 底盘转发
+    ├── protocol/
+    │   └── zdt_frame.cpp            帧构造与流式解析实现（校验 0x6B）
+    ├── transport/
+    │   ├── itransport.cpp           节流队列、收帧按地址路由、统计维护
+    │   ├── uart_transport.cpp       termios 打开、poll 读写、断线重连
+    │   └── can_transport.cpp        SocketCAN 收发 + 扩展帧拆包重组
+    ├── device/
+    │   └── zdt_motor.cpp            物理量 ↔ ZDT 帧、遥测解析、传动比/脉冲换算
+    ├── gimbal/
+    │   ├── axis.cpp                 单轴控制律（斜坡/死区/限位/回中）
+    │   └── gimbal.cpp               双轴调度、看门狗、estop/home/enable 协调
+    ├── link/
+    │   └── udp_control_link.cpp     UDP 收包解码、按频率回发遥测、RTT/丢包统计
+    └── video/
+        └── mjpeg_server.cpp         ★ 图传：V4L2 取 MJPG 帧 → HTTP multipart 转发（零转码）
 ```
+
+> 行数分布（判断改动影响面用）：
+> `main.cpp` 752 · `chassis_link.hpp` 423 · `mjpeg_server.cpp` 401 · `control_link.hpp` 346 ·
+> `zdt_motor.cpp` 221 · `axis.cpp` 148 · `udp_control_link.cpp` 175 · `can_transport.cpp` 172 ·
+> `uart_transport.cpp` 167 · `zdt_frame.cpp` 200 · `fake_transport.hpp` 204 · `itransport.cpp` 77
+>
+> ★ = 协议/接口的关键文件，改动要三端（固件 ↔ Jetson ↔ PC 客户端）同步。
 
 ---
 
@@ -218,40 +250,44 @@ ZDT 支持两种双轴同步（手册 §3.5.2）：
 
 ---
 
-## 7. 底盘接口（占位）
+## 7. 底盘链路（已实现，协议 v2）
 
-`include/gimbal/link/chassis_link.hpp` 定义了 `IChassisLink`：
+`include/gimbal/link/chassis_link.hpp`：`IChassisLink` 抽象 + `UartChassisLink` 真实现
+（CAN 版仍占位，见 §9）。
 
 ```cpp
 struct ChassisCommand { double vx_mmps, vy_mmps, wz_mradps; bool enable, estop, clear_odom; };
-struct ChassisState   { double vx/vy/wz, odom_x/y/yaw; int vbus_mv; uint8_t flags; };
-
-class UartChassisLink : public IChassisLink { … };   // 空实现，不占用串口
-class CanChassisLink  : public IChassisLink { … };   // 空实现，不占用 socket
+struct ChassisState   { double vx/vy/wz, odom_x/y/yaw, gyro_yaw/wz, wheel_rpm[4];
+                        uint16_t status; bool valid; double age_s; };
 ```
 
-**协议草案**（等 STM32F407 硬件到位再落地）：
+🚗 **坐标约定**：`vx` 前进、`vy` 左移、`wz` 逆时针（与底盘库一致，旧"右/前"草案已废弃）。
+
+**USART2 协议（115200，双向 100 Hz）**：
 
 ```
-Jetson -> F407   11-bit 标准帧
-  ID 0x020  DLC 8 : vx(i16 mm/s) | vy(i16 mm/s) | wz(i16 0.01rad/s) | flags | seq
-  ID 0x000        : 广播急停
-F407 -> Jetson
-  ID 0x110  DLC 8 : 里程计 / IMU 反馈
+命令帧 12 B：A5 5A | cmd | seq | vx(i16 mm/s) | vy | wz(i16 0.01rad/s) | flags | CRC8
+反馈帧 40 B：5A A5 | 0x81 | seq | x(i32 mm) y(i32 mm) | yaw | 解算vx/vy/wz |
+             陀螺yaw/wz | status(u16) | cmd_cnt | fb_seq | 四轮RPM(4×i16) | CRC8 | 0x0D
 ```
 
-⚠️ 云台 ZDT 走 **29-bit 扩展帧**，与上面的标准帧**天然隔离，永不冲突**。
+- 命令字：`01` 速度 / `02` 急停 / `03` 小陀螺 / `04` 清零；flags `0x01` = EN
+- 看门狗：Jetson 250 ms 无 UDP → 发 EN=0；F407 100 ms 无帧 → 斜坡停车（**不失能**）
+- 完整字段表、状态位、排障方法见 [`CHASSIS_LINK.md`](CHASSIS_LINK.md)
+
+⚠️ 云台 ZDT 走 UART 扩展帧（CAN 模式），与底盘标准帧天然隔离，二者不冲突。
 
 ---
 
 ## 8. 下一步
 
 - [x] **鼠标控制**：PC 端原生 X11 客户端 `../gimbal_ctl`（已完成）
-- [ ] **联调真机**：接上 CH340 + 两个 ZDT，确认方向极性、pitch 软限位范围
+- [ ] **云台联调**：接上第二个 CH340 + 两个 ZDT（现在唯一的 CH340 给了 F407），
+      确认方向极性、pitch 软限位范围
 - [ ] CAN 总线接入（KH-UCANFD 已装 `kcan` 驱动，`can0/can1` 可用）
 - [ ] 双轴同步运动（多机同步标志 / 多电机命令）
 - [ ] 位置模式（绝对角度指向）
-- [ ] 底盘链路协议落地
+- [x] 底盘链路协议落地（v2：命令 12 B / 反馈 40 B 含四轮转速，已真机验证）
 
 ---
 
@@ -264,3 +300,7 @@ F407 -> Jetson
    联调前请先 `candump can0` 抓包核对。
 3. **X 固件的位置模式未实现**：`mkPositionEmm()` 只覆盖 Emm；用 X 固件需按
    手册 §5.3.10 补一个帧构造器。
+4. **`CanChassisLink` 仍是占位**：CAN 适配器在 Linux 下不可用（见 CHASSIS_LINK.md），
+   UART 链路已验证；换总线时只需实现 `poll()`/`setCommand()`，上层不改。
+5. **图传不做转码**：`mjpeg_server` 直接把摄像头输出的 MJPG 原样转发，
+   不支持 YUYV-only 的摄像头；低光下自动曝光会拉长到 1/15 s，帧率掉到 ~16-20 fps。

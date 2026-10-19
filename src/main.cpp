@@ -1,19 +1,21 @@
 // ===========================================================================
 //  gimbal —— 麦轮小车云台控制器（正式工程）
 //
-//  范围: 只做云台（两个 ZDT 闭环步进）
+//  范围: 云台（两个 ZDT 闭环步进）+ 底盘（STM32F407）
 //            yaw   ID = 2   （导电滑环，360° 连续旋转，无机械限位）
 //            pitch ID = 1
 //        细分 16 -> 3200 脉冲/电机圈
 //        传动比 2:1（电机转 2 圈 = 输出轴 1 圈）
 //
+//  一条 CH340 挂三块 MCU（F407 + 两个 ZDT 驱动板）：
+//      底盘命令帧（12B）+ 云台 ZDT 帧 共用一个串口（`link/unified_serial.hpp`）。
+//
 //  控制入口:
-//    ① UDP 40001  —— PC 鼠标客户端（主通道）
+//    ① UDP 40001  —— PC 鼠标客户端（主通道，有线 / Jetson AP 热点都行）
 //    ② stdin      —— 本地调试命令
 //
 //  用法:
-//      gimbal                          # 真机
-//      gimbal --dry                    # 纯软件模拟
+//      gimbal                          # 真机（底盘 + 云台共用 /dev/ttyUSB0）
 //      gimbal --selftest               # 自检后退出
 //      gimbal --device /dev/ttyTHS1 --gear 2.0 --ctrl-port 40001
 //
@@ -46,7 +48,7 @@
 #include "gimbal/protocol/zdt_frame.hpp"
 #include "gimbal/transport/fake_transport.hpp"
 #include "gimbal/transport/itransport.hpp"
-#include "gimbal/transport/uart_transport.hpp"
+#include "gimbal/link/unified_serial.hpp"   // 底盘 + 云台共用一条串口
 
 using namespace gimbal;
 
@@ -59,7 +61,6 @@ struct Options {
     int         baud       = 115200;
     uint8_t     yaw_addr   = 2;          ///< 用户指定
     uint8_t     pitch_addr = 1;          ///< 用户指定
-    bool        dry        = false;
     bool        selftest   = false;
     double      loop_hz    = 100.0;
 
@@ -76,10 +77,8 @@ struct Options {
     uint16_t    ctrl_port  = CTRL_DEFAULT_PORT;
     bool        no_udp     = false;
 
-    /// 底盘链路（F407 USART2）：第二个 USB-TTL 默认 ttyUSB1
-    std::string chassis_device = "/dev/ttyUSB1";
-    int         chassis_baud   = 115200;
-    bool        no_chassis     = false;
+    /// 底盘与云台共用 --device 指定的串口（--no-chassis 时只控云台）
+    bool        no_chassis = false;
 };
 
 static void usage(const char* a0) {
@@ -99,10 +98,7 @@ static void usage(const char* a0) {
         "  --ctrl-port <n>        UDP 控制口 (默认 40001)\n"
         "  --no-udp               不开 UDP（只用本地 stdin）\n"
         "  --hz <n>               控制频率 (默认 100)\n"
-        "  --chassis-dev <路径>   底盘串口 (默认 /dev/ttyUSB1)\n"
-        "  --chassis-baud <n>     底盘波特率 (默认 115200)\n"
         "  --no-chassis           不接底盘（只控云台）\n"
-        "  --dry                  纯软件模拟\n"
         "  --selftest             自检后退出\n"
         "  -h, --help\n", a0);
 }
@@ -332,7 +328,64 @@ static int runSelftest() {
         ChassisCommand e;
         e.estop = true;
         chassisEncodeCmd(f, e);
-        CHECK(f[2] == chassis_cmd::EStop && f[10] == 0, "急停帧 cmd=0x02 且不带使能");
+        CHECK(f[2] == chassis_cmd::EStop && f[10] == 0, "急停帧 cmd=0x02 且不带 enable");
+    }
+
+    std::printf("\n[7] 单总线帧分流（RxDemux：底盘帧 + ZDT 帧 + 垃圾字节）\n");
+    {
+        // 与 [6] 相同的 40B 底盘反馈帧
+        static const uint8_t fb[CHASSIS_FB_LEN] = {
+            0x5A, 0xA5, 0x81, 0x21, 0x24, 0xFA, 0xFF, 0xFF, 0xC4, 0x09, 0x00,
+            0x00, 0xD8, 0xDC, 0xF4, 0x01, 0x38, 0xFF, 0x5E, 0x01, 0xE0, 0x2E,
+            0x06, 0xFF, 0x13, 0x00, 0xD2, 0x04, 0x4D, 0x00, 0xB0, 0x04, 0xE0,
+            0xFC, 0x2C, 0x01, 0x00, 0x00, 0xFE, 0x0D};
+        // ZDT GetSpeed 应答：addr=1, func=0x35, 正转 300RPM（0x012C）
+        const uint8_t zdt1[] = {0x01, 0x35, 0x00, 0x01, 0x2C, 0x6B};
+        const uint8_t junk[] = {0xFF, 0x00, 0x12, 0x7A};
+
+        RxDemux dx;
+        // 1) 半包：只喂前 20 字节 -> 不应产出任何帧
+        dx.feed(fb, 20);
+        ChassisState st;
+        zdt::Frame fr;
+        CHECK(!dx.popChassis(st) && !dx.popZdt(fr), "半包不产出帧");
+
+        // 2) 补全 + 垃圾 + ZDT 帧 + 又整帧，交错喂入
+        dx.feed(fb + 20, CHASSIS_FB_LEN - 20);
+        dx.feed(junk, sizeof(junk));
+        dx.feed(zdt1, sizeof(zdt1));
+        dx.feed(fb, CHASSIS_FB_LEN);
+
+        int  nfb = 0;
+        bool fb_ok = false;
+        while (dx.popChassis(st)) {
+            ++nfb;
+            if (st.odom_x_mm == -1500 && st.odom_y_mm == 2500 &&
+                std::fabs(st.odom_yaw_deg + 90.0) < 1e-9)
+                fb_ok = true;
+        }
+        int  nz = 0;
+        bool zdt_ok = false;
+        while (dx.popZdt(fr)) {
+            ++nz;
+            if (fr.addr == 1 && fr.func == 0x35 && fr.data.size() == 4 &&
+                fr.data[0] == 0x00 && fr.data[1] == 0x01 &&
+                fr.data[2] == 0x2C && fr.data[3] == 0x6B)
+                zdt_ok = true;
+        }
+        CHECK(nfb == 2 && fb_ok, "两帧底盘反馈被正确切出");
+        CHECK(nz == 1 && zdt_ok, "一帧 ZDT 回帧被正确切出");
+        CHECK(dx.chassisBad() == 0 && dx.zdtBad() == 0, "无坏帧");
+
+        // 3) 逐字节喂入（极端半包），结果应一致
+        RxDemux dx2;
+        for (size_t i = 0; i < CHASSIS_FB_LEN; ++i) dx2.feed(fb + i, 1);
+        for (size_t i = 0; i < sizeof(zdt1); ++i)  dx2.feed(zdt1 + i, 1);
+        int c2 = 0;
+        while (dx2.popChassis(st)) ++c2;
+        int z2 = 0;
+        while (dx2.popZdt(fr)) ++z2;
+        CHECK(c2 == 1 && z2 == 1, "逐字节喂入同样正确");
     }
 
     std::printf("\n=== 自检结束: %s（失败 %d 项）===\n",
@@ -437,25 +490,16 @@ static ControlTelemetry buildTelemetry(const Gimbal& g, uint32_t echo_seq, int r
 }
 
 static int runMain(const Options& o) {
-    // ---- 电机总线 ----
-    std::shared_ptr<ITransport> bus;
-    if (o.dry) {
-        auto f = std::make_shared<FakeTransport>();
-        f->addMotor(o.yaw_addr);
-        f->addMotor(o.pitch_addr);
-        bus = f;
-        std::printf("[main] DRY：FakeTransport（无硬件）\n");
-    } else {
-        UartTransport::Config uc;
-        uc.device = o.device;
-        uc.baud   = o.baud;
-        bus       = std::make_shared<UartTransport>(uc);
-        if (!bus->open()) {
-            std::printf("[main] 打开 %s 失败：%s\n", o.device.c_str(),
-                        bus->stats().last_error.c_str());
-            std::printf("       提示：用 --dry 可在无硬件下先跑通逻辑\n");
-            return 1;
-        }
+    // ---- 单串口总线：底盘（F407）+ 云台（ZDT）共用一个 CH340 ----
+    UnifiedSerial::Config ucc;
+    ucc.device = o.device;
+    ucc.baud   = o.baud;
+    auto link_  = std::make_shared<UnifiedSerial>(ucc);
+    std::shared_ptr<ITransport> bus = link_;
+    if (!link_->open()) {
+        std::printf("[main] 打开 %s 失败：%s\n", o.device.c_str(),
+                    link_->stats().last_error.c_str());
+        return 1;
     }
 
     // ---- 两台电机 ----
@@ -487,22 +531,8 @@ static int runMain(const Options& o) {
 
     Gimbal gimbal(yaw_motor, pitch_motor, gc);
 
-    // ---- 底盘链路（USART2 -> F407）----
-    std::unique_ptr<IChassisLink> chassis;
-    bool chassis_open_failed = false;
-    if (!o.no_chassis) {
-        UartChassisLink::Config cc;
-        cc.device = o.chassis_device;
-        cc.baud   = o.chassis_baud;
-        auto ul = std::make_unique<UartChassisLink>(cc);
-        if (!ul->open()) {
-            std::printf("[main] 底盘串口 %s 打开失败：%s\n",
-                        o.chassis_device.c_str(), ul->stats().last_error.c_str());
-            std::printf("       云台照常工作；插上串口后会自动重连\n");
-            chassis_open_failed = true;
-        }
-        chassis = std::move(ul);
-    }
+    // ---- 底盘：与云台共用同一条串口（--no-chassis 时只控云台）----
+    IChassisLink* chassis = o.no_chassis ? nullptr : link_.get();
 
     // ---- UDP 操作端链路 ----
     std::unique_ptr<UdpControlLink> link;
@@ -525,6 +555,7 @@ static int runMain(const Options& o) {
     std::printf("========================================================\n");
     std::printf("  gimbal 云台控制器\n");
     std::printf("  电机总线: %s\n", bus->name().c_str());
+    std::printf("  底盘    : 与云台共用同一条串口（%s）\n", bus->name().c_str());
     std::printf("  yaw     : addr=%u 传动比 %.2f %s 最大 %.0f°/s\n",
                 o.yaw_addr, o.gear,
                 o.yaw_no_limit ? "无限位(导电滑环)" : "有软限位", o.yaw_rate);
@@ -539,8 +570,7 @@ static int runMain(const Options& o) {
         std::printf("  操作端  : 仅本地 stdin\n");
     }
     if (chassis) {
-        std::printf("  底盘    : %s%s\n", chassis->name().c_str(),
-                    chassis_open_failed ? "（未连上，自动重连中）" : "");
+        std::printf("  底盘    : %s（与云台共用同一串口）\n", chassis->name().c_str());
     } else {
         std::printf("  底盘    : 未接入（--no-chassis）\n");
     }
@@ -597,7 +627,7 @@ static int runMain(const Options& o) {
                                    std::printf("[cmd] enable=%d\n", v); }
             else if (cmd == "x" || cmd == "estop") { gimbal.estop(); local_has = false;
                                    std::printf("[cmd] 急停\n"); }
-            else if (cmd == "s" || cmd == "status") { printStatus(gimbal, *bus, link.get(), chassis.get()); }
+            else if (cmd == "s" || cmd == "status") { printStatus(gimbal, *bus, link.get(), chassis); }
             else if (cmd == "c") { iss >> local_cvx >> local_cvy >> local_cwz; local_c_has = true;
                                    std::printf("[cmd] 底盘 vx=%.0f vy=%.0f wz=%.0f\n",
                                                local_cvx, local_cvy, local_cwz); }
@@ -685,7 +715,7 @@ static int runMain(const Options& o) {
         // ---- 5. 把最新遥测交给链路（链路按频率自动回发）----
         if (link) {
             link->setTelemetry(
-                buildTelemetry(gimbal, echo_seq, link->stats().rx_hz, chassis.get()));
+                buildTelemetry(gimbal, echo_seq, link->stats().rx_hz, chassis));
         }
 
         // ---- 6. 定频 ----
@@ -740,10 +770,7 @@ int main(int argc, char** argv) {
         else if (a == "--ctrl-port")   o.ctrl_port = static_cast<uint16_t>(nexti(CTRL_DEFAULT_PORT));
         else if (a == "--no-udp")      o.no_udp = true;
         else if (a == "--hz")          o.loop_hz = next(o.loop_hz);
-        else if (a == "--chassis-dev" && i + 1 < argc)  o.chassis_device = argv[++i];
-        else if (a == "--chassis-baud") o.chassis_baud = nexti(o.chassis_baud);
         else if (a == "--no-chassis")   o.no_chassis = true;
-        else if (a == "--dry")         o.dry = true;
         else if (a == "--selftest")    o.selftest = true;
         else { std::printf("未知参数: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }

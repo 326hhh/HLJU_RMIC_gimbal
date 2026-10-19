@@ -4,9 +4,10 @@
 //  设计目标：让上层（ZdtMotor / Axis / Gimbal）完全不关心底下是
 //            UART 还是 CAN —— 换总线只换一个实现类。
 //
-//    UartTransport : 当前使用（CH340 / ttyTHS1，115200 8N1）
+//    UnifiedSerial : 当前使用（CH340 / ttyTHS1，115200 8N1；底盘 + 云台共用一个串口，
+//                    实现在 link/unified_serial.hpp，同时实现 ITransport 与 IChassisLink）
 //    CanTransport  : 骨架，等 KH-UCANFD 硬件到货后填（扩展帧 (Addr<<8)|Packet）
-//    FakeTransport : 纯软件模拟电机，用于 --dry 自测（不需要任何硬件）
+//    FakeTransport : 纯软件模拟电机，用于 --selftest（不需要任何硬件）
 //
 //  公共职责（在基类实现，派生类只需 open/close/writeRaw/readRaw）：
 //    · 发送节流队列（ZDT 要求命令间隔 ≥1ms，实测 0ms 时成功率 1/5，本工程用 12ms）
