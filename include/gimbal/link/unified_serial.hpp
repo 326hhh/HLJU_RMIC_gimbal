@@ -97,6 +97,7 @@ public:
         double      chassis_timeout_s   = 0.3;     ///< 反馈超时 -> state().valid=0
         double      reconnect_s         = 0.5;     ///< 断线重连周期
         bool        zdt_after_fb        = true;    ///< ZDT 命令排在底盘反馈静默窗
+        bool        chassis_enabled     = true;    ///< false = 底盘走 CAN（本串口只跑云台 ZDT）
     };
 
     explicit UnifiedSerial(Config c);

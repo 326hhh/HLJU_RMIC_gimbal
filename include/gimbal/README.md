@@ -22,10 +22,11 @@ include/gimbal/
 │   ├── axis.hpp          单轴控制律：斜坡 + 死区 + 软限位 + 回中 + 角度估计
 │   └── gimbal.hpp        双轴协调：统一时钟 + 两级看门狗 + 传输层 poll 去重
 └── link/                 ── 通信链路（对上位机 / 对下位机）──
-    ├── control_link.hpp   ★ UDP 线协议（PC 客户端 ↔ Jetson）
+    ├── control_link.hpp   ★ UDP 线协议 v2（PC 客户端 ↔ Jetson，24 B / 64 B）
     ├── udp_control_link.hpp  UDP 收发实现（非阻塞 socket）
-    ├── chassis_link.hpp   ★ 底盘链路：F407 USART2 协议（命令 12B / 反馈 40B）
-    └── unified_serial.hpp ★ 单串口统一链路：底盘 + 云台共用一个 CH340（ITransport + IChassisLink）
+    ├── chassis_link.hpp   ★ 底盘链路：F407 协议（命令 12B / 反馈 40B，UART/CAN 共用）
+    ├── unified_serial.hpp ★ 单串口统一链路：底盘 + 云台共用一个 CH340（ITransport + IChassisLink）
+    └── can_chassis_link.hpp ★ CAN 底盘链路：0x020/0x021/0x000 + 0x110~0x114 组拼装（SocketCAN）
 ```
 
 ## 2. 分层与依赖方向
@@ -98,11 +99,15 @@ include/gimbal/
 | `gimbal/gimbal.hpp` | `src/gimbal/gimbal.cpp` | 双轴协调 |
 | `link/control_link.hpp` | 无（内联编解码） | UDP 线协议 |
 | `link/udp_control_link.hpp` | `src/link/udp_control_link.cpp` | UDP 收发 |
+| `link/can_chassis_link.hpp` | `src/link/can_chassis_link.cpp` | CAN 底盘链路（`CanChassisLink` + `CanFbGroup`） |
 | `link/chassis_link.hpp` | 无（内联编解码 + 类内实现） | 底盘协议 |
 
-## 6. 单串口链路（已实现）
+## 6. 链路实现概览
 
-一条 CH340 挂三块 MCU（F407 + 两个 ZDT 驱动板）：底盘帧与云台帧共用**同一个串口 fd**，
-实现在 `link/unified_serial.hpp`（`RxDemux` 帧分流 + 静默窗调度）。
-原 `uart_transport.hpp/.cpp` 已删除；`fake_transport.hpp` 保留，只用于 `--selftest`；
-`--dry` 模拟电机跑交互已移除；底盘与云台共用 `--device`，不再有 `--chassis-dev`/`--chassis-baud`。
+- **UART 单串口链路**：一条 CH340 挂三块 MCU（F407 + 两个 ZDT 驱动板），底盘帧与云台帧共用
+  **同一个串口 fd**，实现在 `link/unified_serial.hpp`（`RxDemux` 帧分流 + 静默窗调度）。
+  原 `uart_transport.hpp/.cpp` 已删除；`fake_transport.hpp` 保留，只用于 `--selftest`；
+  `--dry` 模拟电机跑交互已移除；底盘与云台共用 `--device`，不再有 `--chassis-dev`/`--chassis-baud`。
+- **CAN 双链路**：底盘 `link/can_chassis_link.hpp`（SocketCAN 标准帧，`0x020/0x021/0x000` +
+  `0x110~0x114` 组拼装）；云台 `transport/can_transport.hpp`（29-bit 扩展帧，`--device can0`
+  或 `--yaw-can can0`）。ID 类型（标准帧 vs 扩展帧）天然隔离，同一 `can0` 可混跑。

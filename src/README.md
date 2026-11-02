@@ -20,7 +20,8 @@ src/
 │   └── gimbal.cpp           双轴调度、看门狗、estop/home/enable 协调
 ├── link/
 │   ├── udp_control_link.cpp UDP 收包解码、按频率回发遥测、RTT/丢包统计
-│   └── unified_serial.cpp   单串口统一链路：底盘帧 + ZDT 帧共用一个 fd（RxDemux 分流）
+│   ├── unified_serial.cpp   单串口统一链路：底盘帧 + ZDT 帧共用一个 fd（RxDemux 分流）
+│   └── can_chassis_link.cpp  SocketCAN 底盘链路：标准帧 + 0x110~0x114 组规则 + 0x000 急停
 └── video/
     └── mjpeg_server.cpp     独立程序：V4L2 取 MJPG 帧 → HTTP multipart 转发（零转码）
 ```
@@ -57,6 +58,9 @@ cmake --build build -j4
 | `acc` | 200 | 加速度档位 |
 | `ctrl_port` | 40001 | UDP 控制端口 |
 | `no_udp` | false | `--no-udp`：只用本地 stdin |
+| `can` | 空 | `--can <iface>`：等价 `--device can0`（两轴同走 CAN） |
+| `yaw_can` | 空 | `--yaw-can <iface>`：仅 yaw 走 SocketCAN，pitch 仍走 `--device` 串口 |
+| `chassis` | 空 | `--chassis <serial\|canX>`：底盘后端，serial=共用 `--device`，can0=底盘走 CAN |
 | `no_chassis` | false | `--no-chassis`：只控云台 |
 
 ### 3.2 函数一览
@@ -66,13 +70,13 @@ cmake --build build -j4
 | `usage(argv[0])` | 打印帮助（所有命令行参数） |
 | `CHECK(cond, msg)`（宏） | 自检断言：打印 `[ OK ]/[FAIL]`，失败计数加一 |
 | `hex(vector)` | 字节流 → 十六进制字符串（自检比对用） |
-| `runSelftest()` | 纯软件自检，共 6 段（见 3.3） |
+| `runSelftest()` | 纯软件自检，共 9 段（见 3.3） |
 | `printStatus(g, bus, link, chassis)` | 打印云台两轴状态、电机总线统计、操作端统计、底盘状态 |
 | `buildTelemetry(g, echo_seq, rx_hz, chassis)` | 组装 `ControlTelemetry`（云台 + 底盘字段） |
 | `runMain(o)` | 主流程：打开总线 → 建电机/云台/底盘/UDP → 主循环 → 退出清理 |
 | `main(argc, argv)` | 解析参数，`--selftest` 走自检，否则 `runMain` |
 
-### 3.3 `runSelftest()` 的 7 段
+### 3.3 `runSelftest()` 的 9 段
 
 | 段 | 验证内容 |
 |---|---|
@@ -83,6 +87,8 @@ cmake --build build -j4
 | [5] 端到端 | 一总线双电机 + 传动比 2:1：地址路由、斜坡、使能、遥测、看门狗（触发但**不失能**）、软限位、急停后失能 |
 | [6] 底盘协议 | 命令帧编码向量、反馈帧解码向量、单字节破坏被拒、急停帧 cmd=0x02 且不带 EN |
 | [7] 单总线帧分流 | `RxDemux` 半包/逐字节喂入、底盘帧 + ZDT 帧交错、垃圾字节、无坏帧 |
+| [8] CAN 反馈组拼装 | `CanFbGroup`：0x110~0x114 顺序/乱序/缺帧/CRC 坏组/非反馈帧 |
+| [9] 混合传输 | yaw 走 CAN、pitch 走 UART（两轴不同总线），命令/回读各自落在正确总线 |
 
 ### 3.4 `runMain()` 主循环
 
@@ -116,5 +122,5 @@ while (g_run) {
 | `transport/` | [`transport/README.md`](transport/README.md) | 队列/串口/CAN 实现 |
 | `device/` | [`device/README.md`](device/README.md) | 电机设备实现 |
 | `gimbal/` | [`gimbal/README.md`](gimbal/README.md) | 单轴/双轴控制实现 |
-| `link/` | [`link/README.md`](link/README.md) | UDP 链路实现 |
+| `link/` | [`link/README.md`](link/README.md) | UDP 链路 + 单串口统一链路 + CAN 底盘链路实现 |
 | `video/` | [`video/README.md`](video/README.md) | MJPEG 图传实现 |

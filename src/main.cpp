@@ -2,8 +2,8 @@
 //  gimbal —— 麦轮小车云台控制器（正式工程）
 //
 //  范围: 云台（两个 ZDT 闭环步进）+ 底盘（STM32F407）
-//            yaw   ID = 2   （导电滑环，360° 连续旋转，无机械限位）
-//            pitch ID = 1
+//            yaw   ID = 1   （导电滑环，360° 连续旋转，无机械限位）
+//            pitch ID = 2
 //        细分 16 -> 3200 脉冲/电机圈
 //        传动比 2:1（电机转 2 圈 = 输出轴 1 圈）
 //
@@ -16,6 +16,7 @@
 //
 //  用法:
 //      gimbal                          # 真机（底盘 + 云台共用 /dev/ttyUSB0）
+//      gimbal --yaw-can can0           # yaw 走 CAN（can0），pitch + 底盘走串口
 //      gimbal --selftest               # 自检后退出
 //      gimbal --device /dev/ttyTHS1 --gear 2.0 --ctrl-port 40001
 //
@@ -49,6 +50,8 @@
 #include "gimbal/transport/fake_transport.hpp"
 #include "gimbal/transport/itransport.hpp"
 #include "gimbal/link/unified_serial.hpp"   // 底盘 + 云台共用一条串口
+#include "gimbal/link/can_chassis_link.hpp"  // SocketCAN 后端：底盘标准帧
+#include "gimbal/transport/can_transport.hpp"  // SocketCAN 后端：云台 ZDT 扩展帧
 
 using namespace gimbal;
 
@@ -59,8 +62,8 @@ static void onSignal(int) { g_run = false; }
 struct Options {
     std::string device     = "/dev/ttyUSB0";
     int         baud       = 115200;
-    uint8_t     yaw_addr   = 2;          ///< 用户指定
-    uint8_t     pitch_addr = 1;          ///< 用户指定
+    uint8_t     yaw_addr   = 1;          ///< 实机接线：yaw 电机在 ID 1（原默认 2，与 pitch 互换）
+    uint8_t     pitch_addr = 2;          ///< 实机接线：pitch 电机在 ID 2（暂未接入 CAN）
     bool        selftest   = false;
     double      loop_hz    = 100.0;
 
@@ -79,6 +82,12 @@ struct Options {
 
     /// 底盘与云台共用 --device 指定的串口（--no-chassis 时只控云台）
     bool        no_chassis = false;
+    /// 底盘后端：空=自动（云台串口则统一串口；云台 CAN 则同 CAN）；
+    /// "serial"=与云台共用 --device；"can0"/"can1"=SocketCAN
+    std::string chassis    = "";
+
+    /// 仅 yaw 走 SocketCAN 的接口名（如 can0）；非空时 pitch 仍走 --device 串口
+    std::string yaw_can    = "";
 };
 
 static void usage(const char* a0) {
@@ -86,8 +95,8 @@ static void usage(const char* a0) {
         "用法: %s [选项]\n"
         "  --device <路径>        串口设备 (默认 /dev/ttyUSB0)\n"
         "  --baud <n>             波特率 (默认 115200)\n"
-        "  --yaw-addr <n>         yaw 电机地址 (默认 2)\n"
-        "  --pitch-addr <n>       pitch 电机地址 (默认 1)\n"
+        "  --yaw-addr <n>         yaw 电机地址 (默认 1)\n"
+        "  --pitch-addr <n>       pitch 电机地址 (默认 2)\n"
         "  --gear <f>             传动比=电机转数/输出转数 (默认 2.0)\n"
         "  --pulses <n>           脉冲/电机圈 = 200×细分 (默认 3200)\n"
         "  --yaw-limit <a> <b>    给 yaw 启用软限位 (默认关闭)\n"
@@ -98,6 +107,9 @@ static void usage(const char* a0) {
         "  --ctrl-port <n>        UDP 控制口 (默认 40001)\n"
         "  --no-udp               不开 UDP（只用本地 stdin）\n"
         "  --hz <n>               控制频率 (默认 100)\n"
+        "  --can <iface>          SocketCAN 后端（如 can0；等价于 --device can0，两轴同总线）\n"
+        "  --yaw-can <iface>      仅 yaw 走 SocketCAN（如 can0），pitch 仍走 --device 串口\n"
+        "  --chassis <serial|canX> 底盘后端：serial=与云台共用 --device（默认），can0=底盘走 CAN\n"
         "  --no-chassis           不接底盘（只控云台）\n"
         "  --selftest             自检后退出\n"
         "  -h, --help\n", a0);
@@ -388,6 +400,85 @@ static int runSelftest() {
         CHECK(c2 == 1 && z2 == 1, "逐字节喂入同样正确");
     }
 
+    std::printf("\n[8] CAN 反馈组拼装（0x110~0x114 → 40B 反馈帧）\n");
+    {
+        static const uint8_t fb[CHASSIS_FB_LEN] = {
+            0x5A, 0xA5, 0x81, 0x21, 0x24, 0xFA, 0xFF, 0xFF, 0xC4, 0x09, 0x00,
+            0x00, 0xD8, 0xDC, 0xF4, 0x01, 0x38, 0xFF, 0x5E, 0x01, 0xE0, 0x2E,
+            0x06, 0xFF, 0x13, 0x00, 0xD2, 0x04, 0x4D, 0x00, 0xB0, 0x04, 0xE0,
+            0xFC, 0x2C, 0x01, 0x00, 0x00, 0xFE, 0x0D};
+        uint8_t out[CHASSIS_FB_LEN];
+        CanFbGroup g;
+
+        // 顺序拼装
+        CHECK(g.feed(0x110, fb + 0, 8, out) == 0, "0x110 开组未完成");
+        CHECK(g.feed(0x111, fb + 8, 8, out) == 0, "0x111 未完成");
+        CHECK(g.feed(0x112, fb + 16, 8, out) == 0, "0x112 未完成");
+        CHECK(g.feed(0x113, fb + 24, 8, out) == 0, "0x113 未完成");
+        CHECK(g.feed(0x114, fb + 32, 8, out) == 1, "0x114 完成且 CRC 通过");
+        CHECK(std::memcmp(out, fb, CHASSIS_FB_LEN) == 0, "拼装结果与原帧一致");
+
+        // 乱序拼装
+        CHECK(g.feed(0x110, fb + 0, 8, out) == 0, "乱序：开组");
+        CHECK(g.feed(0x113, fb + 24, 8, out) == 0, "乱序：0x113");
+        CHECK(g.feed(0x111, fb + 8, 8, out) == 0, "乱序：0x111");
+        CHECK(g.feed(0x114, fb + 32, 8, out) == 0, "乱序：0x114");
+        CHECK(g.feed(0x112, fb + 16, 8, out) == 1, "乱序补全后完成");
+
+        // 半组被新 0x110 覆盖
+        CHECK(g.feed(0x110, fb + 0, 8, out) == 0, "半组");
+        CHECK(g.feed(0x110, fb + 0, 8, out) == 0, "新组覆盖半组");
+
+        // CRC 失败整组丢弃（破坏 offset 20，落在 0x112 帧里）
+        uint8_t bad[CHASSIS_FB_LEN];
+        std::memcpy(bad, fb, sizeof(bad));
+        bad[20] ^= 0xFF;
+        CHECK(g.feed(0x110, bad + 0, 8, out) == 0, "坏组：开组");
+        CHECK(g.feed(0x111, bad + 8, 8, out) == 0, "坏组：0x111");
+        CHECK(g.feed(0x112, bad + 16, 8, out) == 0, "坏组：0x112");
+        CHECK(g.feed(0x113, bad + 24, 8, out) == 0, "坏组：0x113");
+        CHECK(g.feed(0x114, bad + 32, 8, out) == -1, "坏组：CRC 失败被丢弃");
+
+        // 非反馈 ID / 错误长度忽略
+        CHECK(g.feed(0x020, fb, 8, out) == 0, "非反馈 ID 被忽略");
+        CHECK(g.feed(0x110, fb, 4, out) == 0, "短帧被忽略");
+    }
+
+    std::printf("\n[9] 混合传输：yaw 走 CAN、pitch 走 UART（两轴不同总线）\n");
+    {
+        auto ybus = std::make_shared<FakeTransport>();
+        auto pbus = std::make_shared<FakeTransport>();
+        ybus->addMotor(2);
+        pbus->addMotor(1);
+
+        ZdtMotor::Config yc; yc.addr = 2; yc.poll_speed_ms = 50; yc.poll_pos_ms = 50;
+        ZdtMotor::Config pc; pc.addr = 1; pc.poll_speed_ms = 50; pc.poll_pos_ms = 50;
+        auto yaw_m   = std::make_shared<ZdtMotor>(ybus, yc);
+        auto pitch_m = std::make_shared<ZdtMotor>(pbus, pc);
+
+        Gimbal::Config gc;
+        gc.yaw.name = "yaw";       gc.yaw.gear_ratio = 2.0;
+        gc.yaw.use_soft_limits = false;
+        gc.pitch.name = "pitch";   gc.pitch.gear_ratio = 2.0;
+        gc.pitch.min_deg = -45;    gc.pitch.max_deg = 45;
+        gc.enable_delay_s = 0.05;
+        gc.command_timeout_s = 0.4;
+
+        Gimbal g(yaw_m, pitch_m, gc);
+        CHECK(g.transports().size() == 2, "两轴不同总线 -> 传输层 2 个");
+
+        const double DT = 0.004;
+        for (int i = 0; i < 120; ++i) {
+            g.step(DT);
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(static_cast<int>(DT * 1e6)));
+        }
+        CHECK(ybus->sim(2).tx_seen > 0, "yaw 命令只落在 CAN 总线");
+        CHECK(pbus->sim(1).tx_seen > 0, "pitch 命令只落在串口总线");
+        CHECK(ybus->sim(2).get_seen > 0, "yaw 读取在 CAN 总线回读");
+        CHECK(pbus->sim(1).get_seen > 0, "pitch 读取在串口总线回读");
+    }
+
     std::printf("\n=== 自检结束: %s（失败 %d 项）===\n",
                 g_fail == 0 ? "全部通过" : "有失败", g_fail);
     return g_fail == 0 ? 0 : 1;
@@ -396,8 +487,9 @@ static int runSelftest() {
 // ===========================================================================
 // 运行时
 // ===========================================================================
-static void printStatus(const Gimbal& g, const ITransport& bus,
-                        const UdpControlLink* link, const IChassisLink* chassis) {
+static void printStatus(const Gimbal& g, const ITransport& yaw_bus,
+                        const ITransport& pitch_bus, const UdpControlLink* link,
+                        const IChassisLink* chassis) {
     auto line = [](const Axis& a) {
         const auto& s = a.motorStatus();
         std::printf("  %-6s 指令=%7.1f°/s 实际=%7.1f°/s 输出角=%9.2f° "
@@ -414,13 +506,17 @@ static void printStatus(const Gimbal& g, const ITransport& bus,
     std::printf("--- 状态 ---\n");
     line(g.yaw());
     line(g.pitch());
-    const auto& st = bus.stats();
-    std::printf("  电机总线: %-18s 连接=%d 发送=%llu 丢弃=%llu 收帧=%llu 重连=%llu\n",
-                bus.name().c_str(), st.connected ? 1 : 0,
-                static_cast<unsigned long long>(st.tx_frames),
-                static_cast<unsigned long long>(st.tx_dropped),
-                static_cast<unsigned long long>(st.rx_frames),
-                static_cast<unsigned long long>(st.reconnects));
+    auto busLine = [](const char* tag, const ITransport& b) {
+        const auto& st = b.stats();
+        std::printf("  %s总线: %-18s 连接=%d 发送=%llu 丢弃=%llu 收帧=%llu 重连=%llu\n",
+                    tag, b.name().c_str(), st.connected ? 1 : 0,
+                    static_cast<unsigned long long>(st.tx_frames),
+                    static_cast<unsigned long long>(st.tx_dropped),
+                    static_cast<unsigned long long>(st.rx_frames),
+                    static_cast<unsigned long long>(st.reconnects));
+    };
+    busLine("yaw  ", yaw_bus);
+    if (&yaw_bus != &pitch_bus) busLine("pitch", pitch_bus);
     if (link) {
         const auto& ls = link->stats();
         std::printf("  操作端  : %-18s 收=%llu 坏=%llu 丢=%llu @%dHz 时效=%.2fs\n",
@@ -490,19 +586,115 @@ static ControlTelemetry buildTelemetry(const Gimbal& g, uint32_t echo_seq, int r
 }
 
 static int runMain(const Options& o) {
-    // ---- 单串口总线：底盘（F407）+ 云台（ZDT）共用一个 CH340 ----
-    UnifiedSerial::Config ucc;
-    ucc.device = o.device;
-    ucc.baud   = o.baud;
-    auto link_  = std::make_shared<UnifiedSerial>(ucc);
-    std::shared_ptr<ITransport> bus = link_;
-    if (!link_->open()) {
-        std::printf("[main] 打开 %s 失败：%s\n", o.device.c_str(),
-                    link_->stats().last_error.c_str());
+    // ---- 后端：云台（串口 或 CAN）+ 底盘（统一串口 或 CAN）----
+    //   典型组合：
+    //     默认（全部串口）           ./build/gimbal
+    //     底盘 CAN / 云台 UART      ./build/gimbal --chassis can0
+    //     全部 CAN                  ./build/gimbal --device can0
+    //     yaw CAN / pitch UART      ./build/gimbal --yaw-can can0
+    const bool split      = !o.yaw_can.empty();               // 仅 yaw 走 CAN
+    const bool gimbal_can = (o.device.rfind("can", 0) == 0) && !split;
+
+    if (split && o.device.rfind("can", 0) == 0) {
+        std::printf("[main] --yaw-can 与 --device canX 冲突（后者表示两轴同走 CAN）\n");
         return 1;
     }
 
-    // ---- 两台电机 ----
+    bool        chassis_can   = false;
+    std::string chassis_iface = o.device;
+    if (!o.no_chassis) {
+        if (o.chassis.empty()) {
+            chassis_can   = gimbal_can;                  // 自动：两轴同 CAN -> 底盘同 CAN
+            chassis_iface = gimbal_can ? o.device : "";
+        } else if (o.chassis.rfind("can", 0) == 0) {
+            if (gimbal_can) {
+                std::printf("[main] 云台已走 CAN（%s），底盘直接共用该 CAN 即可（去掉 --chassis）\n",
+                            o.device.c_str());
+                return 1;
+            }
+            chassis_can   = true;
+            chassis_iface = o.chassis;
+        } else {
+            if (gimbal_can) {
+                std::printf("[main] 云台走 CAN 时底盘只能走 CAN（--chassis can0）或 --no-chassis\n");
+                return 1;
+            }
+            chassis_can = false;                         // 统一串口
+        }
+    }
+
+    std::shared_ptr<ITransport>      yaw_bus;
+    std::shared_ptr<ITransport>      pitch_bus;
+    std::shared_ptr<UnifiedSerial>   serial_link;
+    std::unique_ptr<CanChassisLink>  can_chassis;
+
+    if (split) {
+        // pitch + 底盘：串口
+        UnifiedSerial::Config ucc;
+        ucc.device          = o.device;
+        ucc.baud            = o.baud;
+        ucc.chassis_enabled = !o.no_chassis && !chassis_can;   // 底盘走 CAN 时串口只跑云台
+        serial_link = std::make_shared<UnifiedSerial>(ucc);
+        if (!serial_link->open()) {
+            std::printf("[main] 打开 %s 失败：%s\n", o.device.c_str(),
+                        serial_link->stats().last_error.c_str());
+            return 1;
+        }
+        pitch_bus = serial_link;
+        std::printf("[main] pitch 后端: 串口 %s%s\n", o.device.c_str(),
+                    ucc.chassis_enabled ? "（底盘也走此串口）" : "（只跑云台 ZDT）");
+
+        // yaw：CAN
+        CanTransport::Config ctc;
+        ctc.iface = o.yaw_can;
+        auto yb = std::make_shared<CanTransport>(ctc);
+        if (!yb->open()) {
+            std::printf("[main] 打开 %s 失败：%s\n", o.yaw_can.c_str(),
+                        yb->stats().last_error.c_str());
+            return 1;
+        }
+        yaw_bus = yb;
+        std::printf("[main] yaw 后端: SocketCAN %s（ZDT 扩展帧）\n", o.yaw_can.c_str());
+    } else if (gimbal_can) {
+        CanTransport::Config ctc;
+        ctc.iface = o.device;
+        auto b = std::make_shared<CanTransport>(ctc);
+        if (!b->open()) {
+            std::printf("[main] 打开 %s 失败：%s\n", o.device.c_str(),
+                        b->stats().last_error.c_str());
+            return 1;
+        }
+        yaw_bus = pitch_bus = b;
+        std::printf("[main] 云台后端: SocketCAN %s（ZDT 扩展帧，两轴同总线）\n", o.device.c_str());
+    } else {
+        UnifiedSerial::Config ucc;
+        ucc.device          = o.device;
+        ucc.baud            = o.baud;
+        ucc.chassis_enabled = !o.no_chassis && !chassis_can;   // 底盘走 CAN 时串口只跑云台
+        serial_link = std::make_shared<UnifiedSerial>(ucc);
+        if (!serial_link->open()) {
+            std::printf("[main] 打开 %s 失败：%s\n", o.device.c_str(),
+                        serial_link->stats().last_error.c_str());
+            return 1;
+        }
+        yaw_bus = pitch_bus = serial_link;
+        std::printf("[main] 云台后端: 串口 %s%s\n", o.device.c_str(),
+                    ucc.chassis_enabled ? "（底盘也走此串口）" : "（只跑云台 ZDT）");
+    }
+
+    if (!o.no_chassis && chassis_can) {
+        CanChassisLink::Config cc;
+        cc.iface = chassis_iface;
+        can_chassis = std::make_unique<CanChassisLink>(cc);
+        if (!can_chassis->open()) {
+            std::printf("[main] CAN 底盘链路打开失败：%s\n",
+                        can_chassis->stats().last_error.c_str());
+            return 1;
+        }
+        std::printf("[main] 底盘后端: SocketCAN %s（标准帧）\n", chassis_iface.c_str());
+    }
+
+    // ---- 两台电机（可分别挂在不同的总线上）----
     ZdtMotor::Config yc;
     yc.addr           = o.yaw_addr;
     yc.pulses_per_rev = o.pulses_per_motor_rev;
@@ -510,8 +702,8 @@ static int runMain(const Options& o) {
     ZdtMotor::Config pc = yc;
     pc.addr = o.pitch_addr;
 
-    auto yaw_motor   = std::make_shared<ZdtMotor>(bus, yc);
-    auto pitch_motor = std::make_shared<ZdtMotor>(bus, pc);
+    auto yaw_motor   = std::make_shared<ZdtMotor>(yaw_bus,   yc);
+    auto pitch_motor = std::make_shared<ZdtMotor>(pitch_bus, pc);
 
     // ---- 云台 ----
     Gimbal::Config gc;
@@ -532,7 +724,11 @@ static int runMain(const Options& o) {
     Gimbal gimbal(yaw_motor, pitch_motor, gc);
 
     // ---- 底盘：与云台共用同一条串口（--no-chassis 时只控云台）----
-    IChassisLink* chassis = o.no_chassis ? nullptr : link_.get();
+    IChassisLink* chassis = nullptr;
+    if (!o.no_chassis) {
+        if (can_chassis)      chassis = can_chassis.get();
+        else if (serial_link) chassis = serial_link.get();
+    }
 
     // ---- UDP 操作端链路 ----
     std::unique_ptr<UdpControlLink> link;
@@ -554,8 +750,8 @@ static int runMain(const Options& o) {
 
     std::printf("========================================================\n");
     std::printf("  gimbal 云台控制器\n");
-    std::printf("  电机总线: %s\n", bus->name().c_str());
-    std::printf("  底盘    : 与云台共用同一条串口（%s）\n", bus->name().c_str());
+    std::printf("  yaw 总线 : %s\n", yaw_bus->name().c_str());
+    std::printf("  pitch 总线: %s\n", pitch_bus->name().c_str());
     std::printf("  yaw     : addr=%u 传动比 %.2f %s 最大 %.0f°/s\n",
                 o.yaw_addr, o.gear,
                 o.yaw_no_limit ? "无限位(导电滑环)" : "有软限位", o.yaw_rate);
@@ -570,7 +766,7 @@ static int runMain(const Options& o) {
         std::printf("  操作端  : 仅本地 stdin\n");
     }
     if (chassis) {
-        std::printf("  底盘    : %s（与云台共用同一串口）\n", chassis->name().c_str());
+        std::printf("  底盘    : %s\n", chassis->name().c_str());
     } else {
         std::printf("  底盘    : 未接入（--no-chassis）\n");
     }
@@ -627,7 +823,7 @@ static int runMain(const Options& o) {
                                    std::printf("[cmd] enable=%d\n", v); }
             else if (cmd == "x" || cmd == "estop") { gimbal.estop(); local_has = false;
                                    std::printf("[cmd] 急停\n"); }
-            else if (cmd == "s" || cmd == "status") { printStatus(gimbal, *bus, link.get(), chassis); }
+            else if (cmd == "s" || cmd == "status") { printStatus(gimbal, *yaw_bus, *pitch_bus, link.get(), chassis); }
             else if (cmd == "c") { iss >> local_cvx >> local_cvy >> local_cwz; local_c_has = true;
                                    std::printf("[cmd] 底盘 vx=%.0f vy=%.0f wz=%.0f\n",
                                                local_cvx, local_cvy, local_cwz); }
@@ -757,8 +953,8 @@ int main(int argc, char** argv) {
         if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         else if (a == "--device" && i + 1 < argc) o.device = argv[++i];
         else if (a == "--baud")        o.baud = nexti(o.baud);
-        else if (a == "--yaw-addr")    o.yaw_addr = static_cast<uint8_t>(nexti(2));
-        else if (a == "--pitch-addr")  o.pitch_addr = static_cast<uint8_t>(nexti(1));
+        else if (a == "--yaw-addr")    o.yaw_addr = static_cast<uint8_t>(nexti(1));
+        else if (a == "--pitch-addr")  o.pitch_addr = static_cast<uint8_t>(nexti(2));
         else if (a == "--gear")        o.gear = next(o.gear);
         else if (a == "--pulses")      o.pulses_per_motor_rev = static_cast<uint32_t>(nexti(3200));
         else if (a == "--yaw-limit")   { o.yaw_min = next(o.yaw_min); o.yaw_max = next(o.yaw_max);
@@ -768,6 +964,9 @@ int main(int argc, char** argv) {
         else if (a == "--pitch-rate")  o.pitch_rate = next(o.pitch_rate);
         else if (a == "--acc")         o.acc = nexti(200);
         else if (a == "--ctrl-port")   o.ctrl_port = static_cast<uint16_t>(nexti(CTRL_DEFAULT_PORT));
+        else if (a == "--can" && i + 1 < argc) o.device = argv[++i];
+        else if (a == "--yaw-can" && i + 1 < argc) o.yaw_can = argv[++i];
+        else if (a == "--chassis" && i + 1 < argc) o.chassis = argv[++i];
         else if (a == "--no-udp")      o.no_udp = true;
         else if (a == "--hz")          o.loop_hz = next(o.loop_hz);
         else if (a == "--no-chassis")   o.no_chassis = true;

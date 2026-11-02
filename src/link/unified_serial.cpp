@@ -308,6 +308,7 @@ void UnifiedSerial::poll() {
     // ---- 消费分流结果：底盘状态 / ZDT 帧队列 ----
     ChassisState st;
     while (demux_.popChassis(st)) {
+        if (!cfg_.chassis_enabled) continue;   /* 底盘走 CAN：串口上的底盘帧只当噪声 */
         state_               = st;
         state_.valid         = true;
         state_.age_s         = 0.0;
@@ -320,8 +321,10 @@ void UnifiedSerial::poll() {
     }
     while (rxq_.size() > 256) rxq_.pop_front();
 
-    state_.age_s = static_cast<double>(now - last_chassis_rx_us_) / 1e6;
-    if (state_.age_s > cfg_.chassis_timeout_s) state_.valid = false;
+    if (cfg_.chassis_enabled) {
+        state_.age_s = static_cast<double>(now - last_chassis_rx_us_) / 1e6;
+        if (state_.age_s > cfg_.chassis_timeout_s) state_.valid = false;
+    }
 
     // ---- 发：ZDT 帧（12ms 节流；尽量落在底盘反馈后的静默窗）----
     if (zdtWindowOpen(now)) {
@@ -332,9 +335,9 @@ void UnifiedSerial::poll() {
         }
     }
 
-    // ---- 发：底盘命令（固定 5ms 节流）----
-    if (now - last_chassis_tx_us_ >=
-        static_cast<int64_t>(cfg_.chassis_tx_period_s * 1e6)) {
+    // ---- 发：底盘命令（固定 5ms 节流；底盘走 CAN 时这里不发）----
+    if (cfg_.chassis_enabled &&
+        now - last_chassis_tx_us_ >= static_cast<int64_t>(cfg_.chassis_tx_period_s * 1e6)) {
         last_chassis_tx_us_ = now;
         sendChassis();
     }

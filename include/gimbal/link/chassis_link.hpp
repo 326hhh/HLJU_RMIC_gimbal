@@ -74,6 +74,7 @@ constexpr uint16_t DriverOn  = 0x0010;
 constexpr uint16_t Spin      = 0x0020;
 constexpr uint16_t GyroOn    = 0x0040;
 constexpr uint16_t ImuCal    = 0x0080;
+constexpr uint16_t CanErr    = 0x0100;  ///< CAN error-passive（TEC>96，见 CAN 协议 §4）
 }  // namespace chassis_status
 
 // ---- CRC-8/ATM（校验值 "123456789" = 0xF4）-------------------------------

@@ -1,20 +1,26 @@
-# gimbal/src/link —— UDP 链路实现
+# gimbal/src/link —— 链路实现（UDP 操作端 + 单串口统一链路 + CAN 底盘链路）
 
-本目录只有 `udp_control_link.cpp`：实现 `include/gimbal/link/udp_control_link.hpp` 的
-`UdpControlLink` —— 与 PC 客户端之间的低延迟控制通道（Jetson 侧）。
+本目录三个实现文件：
 
-> 线协议定义（帧布局、校验、flags）在 `include/gimbal/link/control_link.hpp`，
-> 两端必须逐字节一致；本文件只负责 socket 收发与状态维护。
+- `udp_control_link.cpp`：`UdpControlLink` —— 与 PC 客户端之间的低延迟控制通道（Jetson 侧）。
+- `unified_serial.cpp`：`UnifiedSerial` —— 单串口统一链路，底盘 F407 帧 + 云台 ZDT 帧共用一个 fd
+  （`RxDemux` 按帧边界分流；实现 `ITransport` + `IChassisLink` 双接口）。
+- `can_chassis_link.cpp`：`CanChassisLink` —— SocketCAN 底盘链路（标准帧 + `0x110~0x114` 组规则 + `0x000` 急停）。
 
-## 文件一览
+> UDP 线协议定义（帧布局、校验、flags）在 `include/gimbal/link/control_link.hpp`；
+> 底盘帧定义在 `include/gimbal/link/chassis_link.hpp`；两端必须逐字节一致。
+
+**文件一览**
 
 | 文件 | 内容 |
 |---|---|
 | `udp_control_link.cpp` | 非阻塞 UDP 收发、peer 管理、seq 丢包统计、遥测按频率回发 |
+| `unified_serial.cpp` | 单串口统一链路：底盘帧 + ZDT 帧共用一个 fd（节流 + `RxDemux` 分流） |
+| `can_chassis_link.cpp` | SocketCAN 底盘链路：标准帧收发 + 0x110~0x114 组规则 + 0x000 急停 |
 
 ---
 
-## 1. 函数一览
+## 1. `UdpControlLink` 函数一览
 
 | 函数 | 行为 |
 |---|---|
@@ -58,3 +64,33 @@
 | 丢包统计 `rx_lost`（按 seq 跳号） | RTT 统计（按 `echo_seq` 回显匹配） |
 
 协议常量都来自 `control_link.hpp` 的同一份定义，改协议时**必须两端同步**。
+
+---
+
+## 5. `CanChassisLink` —— CAN 底盘链路（SocketCAN 标准帧）
+
+对应头文件 `include/gimbal/link/can_chassis_link.hpp`。与 `UnifiedSerial` 的 UART 底盘链路
+二选一（`--chassis can0` / `--device can0` 时启用），命令/反馈字段与 UART 版完全一致。
+
+| 部分 | 行为 |
+|---|---|
+| `Config` | `iface`（默认 can0）、命令 10 ms、flags 10 Hz、组超时 5 ms、反馈超时 100 ms、socket 重开 1 s |
+| `CanFbGroup` | `0x110` 开组 → `0x111~0x114` 按序填入 → 新 `0x110` 冲掉未满组 → 组超时丢弃 → CRC8/尾字节失败整组丢弃；返回 `1` 完整、`0` 未完成、`-1` 坏组 |
+| `tryOpen()` | `socket(PF_CAN, SOCK_RAW)` → `SIOCGIFINDEX` → `bind` → `O_NONBLOCK` |
+| `poll()` | 重连检查 → 收帧喂给 `CanFbGroup` → 完整组立即 `chassisDecodeFb` 更新 `state_` → 按周期发 `0x020`/`0x021` → 反馈超时置 `valid=false` |
+| `setCommand()` | 缓存 `ChassisCommand`；EN 由命令帧 flags 控制；`estop` 置位后发 `0x000`（DLC=0），恢复需 EN=1 |
+| `sendFlagsFrame()` | 10 Hz 保活 + `enable` 变化时**立即**发一次 |
+
+帧表 / 组完整性规则 / 语义细节（`0x021` 不计 `cmd_cnt`、`CAN_ERR` 实时位）见底盘仓库
+`docs/CAN_CONTROL_PROTOCOL.md`。
+
+## 6. `UnifiedSerial` —— 单串口统一链路（UART）
+
+对应头文件 `include/gimbal/link/unified_serial.hpp`。一个 CH340 上挂三块 MCU
+（F407 + 两个 ZDT 驱动板），同一 fd 同时实现 `ITransport`（云台）与 `IChassisLink`（底盘）：
+
+- **TX**：底盘帧按 5 ms 节流、ZDT 帧按 12 ms 节流，各自整帧写入；
+- **RX**：`RxDemux` 按帧边界分流 —— `5A A5 81` + 40B + CRC8 + `0D` → 底盘解码器；
+  `Addr∈1..32` + func + … + `6B` → ZDT 帧；避免底盘反馈字节被 ZDT 解析器误拆成假帧；
+- **静默窗**：ZDT 命令尽量排在"刚收到底盘反馈后的静默窗"发送，避免三台从机 TX 抢线；
+- 底盘反馈超时 0.3 s 置 `valid=false`；socket 断线自动重连。

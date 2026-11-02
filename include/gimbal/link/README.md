@@ -15,6 +15,7 @@
 | `udp_control_link.hpp` | UDP 收发实现（非阻塞 socket + 遥测回发 + 丢包统计） |
 | `chassis_link.hpp` | 底盘协议（12B 命令 / 40B 反馈）+ `IChassisLink` 抽象（UART 实现在 unified_serial） |
 | `unified_serial.hpp` | ★ 单串口统一链路：底盘帧 + ZDT 帧共用一个 fd（`RxDemux` 帧分流） |
+| `can_chassis_link.hpp` | ★ SocketCAN 底盘链路：0x020/0x021/0x000 命令 + 0x110~0x114 反馈组拼装 |
 
 ---
 
@@ -205,12 +206,19 @@ struct Config {
 - `chassisEncodeCmd(out[12], cmd)`：按 3.1 表编码（wz 除以 10 换成 0.01 rad/s）；
 - `chassisDecodeFb(in[40], ChassisState&)`：校验帧头/类型/帧尾/CRC 后逐字段译码。
 
-### 3.5 收发送实现（在 `link/unified_serial.hpp`）
+### 3.5 收发实现
 
-`UartChassisLink` / `CanChassisLink` 已删除，底盘帧的收发并入单串口统一链路：
-- `UnifiedSerial`：底盘命令 5ms 节流、反馈超时 0.3s 置 `valid=false`；
-- `RxDemux`：`5A A5 81` + 40B + CRC8 + `0D` → 底盘解码器；`Addr∈1..32` + func + … + `6B` → ZDT 帧；
-- 详见本节顶部「单串口链路」与 `unified_serial` 文档。
+底盘帧的**两种收发实现**：
+
+- **UART**：并入 `link/unified_serial.hpp` 的单串口统一链路（原 `UartChassisLink` 已并入，
+  不再单独存在）：
+  - `UnifiedSerial`：底盘命令 5ms 节流、反馈超时 0.3s 置 `valid=false`；
+  - `RxDemux`：`5A A5 81` + 40B + CRC8 + `0D` → 底盘解码器；`Addr∈1..32` + func + … + `6B` → ZDT 帧；
+  - 详见 §5「单串口链路」与 `unified_serial` 文档。
+- **CAN**：`link/can_chassis_link.hpp` 的 `CanChassisLink`（SocketCAN 标准帧）：
+  `0x020` 100 Hz 命令、`0x021` 10 Hz 保活、`0x000` 广播急停、`0x110~0x114` 反馈五帧；
+  `CanFbGroup` 负责组拼装（组超时 5 ms、CRC 失败整组丢弃）。
+  帧表与组规则见底盘仓库 `docs/CAN_CONTROL_PROTOCOL.md`。
 
 ## 4. 链路状态位对照（Jetson ↔ F407）
 
@@ -224,6 +232,7 @@ struct Config {
 | `Spin` | 0x0020 | `ULINK_ST_SPIN` |
 | `GyroOn` | 0x0040 | `ULINK_ST_GYRO_ON` |
 | `ImuCal` | 0x0080 | `ULINK_ST_IMU_CAL` |
+| `CanErr` | 0x0100 | `ULINK_ST_CAN_ERR`（CAN error-passive，TEC/REC > 96） |
 
 ## 5. 单串口链路（已实现）
 

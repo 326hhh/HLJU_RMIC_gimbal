@@ -1,5 +1,6 @@
 #include "gimbal/transport/can_transport.hpp"
 
+#include <fcntl.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
 #include <net/if.h>
@@ -27,10 +28,12 @@ CanTransport::~CanTransport() { close(); }
 
 std::string CanTransport::name() const { return "can:" + cfg_.iface; }
 
+bool CanTransport::isOpen() const { return fd_ >= 0; }
+
 bool CanTransport::open() {
     if (fd_ >= 0) return true;
 
-    fd_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    fd_ = ::socket(PF_CAN, SOCK_RAW | SOCK_CLOEXEC, CAN_RAW);
     if (fd_ < 0) {
         stats_.last_error = std::string("socket: ") + std::strerror(errno);
         return false;
@@ -56,6 +59,10 @@ bool CanTransport::open() {
         fd_ = -1;
         return false;
     }
+
+    /* 非阻塞：poll() 里的收帧循环读空即返回，绝不能阻塞主控制循环 */
+    const int fl = ::fcntl(fd_, F_GETFL, 0);
+    ::fcntl(fd_, F_SETFL, fl | O_NONBLOCK);
 
     stats_.connected = true;
     stats_.last_error.clear();

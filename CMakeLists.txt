@@ -26,6 +26,7 @@ set(GIMBAL_SOURCES
     src/gimbal/gimbal.cpp
     src/link/udp_control_link.cpp
     src/link/unified_serial.cpp
+    src/link/can_chassis_link.cpp
 )
 
 add_library(gimbal_core STATIC ${GIMBAL_SOURCES})

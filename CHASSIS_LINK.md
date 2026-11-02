@@ -9,20 +9,21 @@
 ## 1. 系统拓扑
 
 ```
-笔记本(PC)                         Jetson Nano                       STM32F407
-┌──────────────┐   WiFi 或 网线   ┌──────────────┐   USB-TTL(115200)  ┌────────────┐
-│ gimbal_ctl   │ ──── UDP ────►  │ gimbal       │ ─── USART2 ──────► │ uart_link  │
-│ (C++17, X11) │  24B/56B        │ (C++17 守护) │  PD5(TX)/PD6(RX)   │ (1kHz 控制)│
-└──────────────┘                  └──────────────┘                    └────────────┘
-                                        │  USB-TTL → ZDT 步进 ×2（云台，暂未接）
-                                        └─ 目前唯一 CH340 给了 F407
+笔记本(PC)                            Jetson Nano                          STM32F407
+┌──────────────┐   WiFi 或 网线      ┌──────────────┐   串口(115200) ┌────────────┐
+│ gimbal_ctl   │ ──── UDP ────►    │ gimbal       │ ─── USART2 ──► │ uart_link  │
+│ (C++17, X11) │  24B/64B          │ (C++17 守护) │  PD5(TX)/PD6(RX)│ (1kHz 控制)│
+└──────────────┘                    └──────────────┘  └── 或 CAN ──► │ can_link   │
+                                        │  USB-TTL → ZDT 步进 ×2（云台，暂未接）  └────────────┘
+                                        │  USB-CAN(CANable) → can0（底盘 + 可扩展云台）
 ```
 
 | 角色 | 设备/端口 | 说明 |
 |---|---|---|
 | 笔记本 ↔ Jetson（有线） | `enp8s0 192.168.2.1` ↔ `eth0 192.168.2.2` | `ssh Jetson` 免密 |
 | 笔记本 ↔ Jetson（无线） | 笔记本 WiFi ↔ Jetson AP `MECAR-CTRL` / `10.42.0.1` | 车要走位时用这条 |
-| Jetson ↔ F407 | `/dev/ttyUSB0`（CH340）115200 8N1 | 底盘控制链路 |
+| Jetson ↔ F407（串口） | `/dev/ttyUSB0`（CH340）115200 8N1 | 底盘 + 云台共用一条 CH340 |
+| Jetson ↔ F407（CAN） | CANable 2.0 → `can0`，1 Mbps 标准帧 | 底盘 CAN 链路（见 §3.5） |
 | 笔记本 ↔ F407 调试 | `/dev/ttyACM0`（DAP-LINK 虚拟串口）| USART1 调试打印，115200 |
 | UDP 控制口 | `40001`（默认）| `gimbal_ctl` → `gimbal` |
 
@@ -95,12 +96,42 @@
 | `0x0020` | SPIN | 小陀螺模式 |
 | `0x0040` | GYRO_ON | 陀螺外环非 OFF |
 | `0x0080` | IMU_CAL | 零偏标定有效 |
+| `0x0100` | CAN_ERR | CAN error-passive 预警（TEC/REC > 96，**仅 CAN 链路会出现**；Jetson 侧 `chassis_status::CanErr` 同名解码） |
 
 ### 3.4 安全语义（三层）
 
 1. **Jetson 侧**：UDP 指令断流 250 ms → 主动发 EN=0 停车帧
 2. **F407 侧**：控制帧 100 ms 未到 → 目标速度清零走斜坡减速，**但 STBY 保持高**（不松轴）
 3. **急停**：只有 `x`/`cx` 才拉低 STBY（电机自由）
+
+### 3.5 CAN 底盘链路（`can0`，11-bit 标准帧，1 Mbps）
+
+`CanChassisLink`（`src/link/can_chassis_link.cpp`）用 SocketCAN 实现同一套协议：
+
+| ID | 方向 | 内容 | 备注 |
+|---|---|---|---|
+| `0x000` | Jetson → F407 | 广播急停 | DLC 任意（含 0）；**Jetson 发、F407 只收不发**；ID 最小 = 仲裁最高优先级 |
+| `0x020` | Jetson → F407 | `[cmd, seq, vx(i16), vy(i16), wz(i16)]`，100 Hz | 与串口命令帧字段语义一致（flags 取自 `0x021`） |
+| `0x021` | Jetson → F407 | `[flags]`（bit0 = EN），10 Hz 保活 + 变化即发 | 只是标志帧，**不计入 `cmd_cnt`**、不喂看门狗 |
+| `0x110~0x114` | F407 → Jetson | 40 B 反馈按 8 字节切 5 帧（字段同 §3.2），100 Hz | 接收端按组规则拼装 |
+
+**组完整性规则**（`CanFbGroup`）：`0x110` 开新组 → `0x111~0x114` 按序填入 → 下一个 `0x110`
+冲掉未满旧组 → 组超时 **5 ms** 丢弃 → `crc8` 失败整组丢弃（不输出半帧）。
+
+**Jetson 侧参数**：命令 10 ms、flags 10 Hz、组超时 5 ms、反馈超时 100 ms（`state().valid=0`）、
+socket 重开 1 s。起 `can0`：
+
+```bash
+sudo slcand -o -s8 -t hw /dev/ttyACM1 can0 && sudo ip link set can0 up   # 编号以 ls /dev/ttyACM* 为准
+candump -td can0      # 应看到 0x110~0x114 每 10ms 一组、组内连续
+cansend can0 021#01   # EN 开；随后 020 速度才生效
+cansend can0 000#     # 广播急停（DLC=0 也认）
+```
+
+**UART 与 CAN 的取舍**：只有一个 CH340 时用 UART（`UnifiedSerial`，底盘 + 云台共线）；
+需要更短总线、多设备（ZDT 云台也上 CAN）时用 CAN（`--chassis can0` 或全 CAN `--device can0`）。
+两者命令/反馈字段完全一致，上层 `IChassisLink` 不用改。协议细节见底盘仓库
+`docs/CAN_CONTROL_PROTOCOL.md` 与 `UserLib/Comm/README.md`。
 
 ---
 
@@ -184,11 +215,20 @@ cd ~/gimbal
 cd ~/gimbal
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
+ctest --test-dir build                                     # = gimbal --selftest（9 段）
 
-./build/gimbal --selftest                                  # 纯软件自检
-./build/gimbal --dry --chassis-dev /dev/ttyUSB0            # 云台模拟 + 真底盘
-./build/gimbal --device /dev/ttyUSB1 --chassis-dev /dev/ttyUSB0   # 云台串口就位后用这条
+# 全串口（底盘 + 云台共用一个 CH340；云台暂未接也能跑，底盘正常转发）
+./build/gimbal --device /dev/ttyUSB0
+# 混合：云台 UART + 底盘 CAN（推荐先跑这个）
+./build/gimbal --chassis can0
+# 全 CAN：两轴 ZDT 扩展帧 + 底盘标准帧同一条 can0（ZDT 切 CAN 模式后）
+./build/gimbal --device can0
+# 只控云台（不接底盘）
+./build/gimbal --device /dev/ttyUSB0 --no-chassis
 ```
+
+> 已移除 `--dry`（FakeTransport 现只用于 `--selftest`）与 `--chassis-dev / --chassis-baud`
+> （底盘不再单独占口，与云台共用 `--device`；或 `--chassis can0` 走 CAN）。
 
 ### 6.2 笔记本
 
@@ -199,12 +239,13 @@ cd ~/gimbal_ctl && ./build/gimbal_ctl --host 10.42.0.1      # 无线
 
 | 按键 | 作用 |
 |---|---|
-| 鼠标移动 | 云台 yaw/pitch |
+| `←/→` | 云台 yaw 左/右（按住转，松开停；速率 `--gimbal-rate`） |
+| `↑/↓` | 云台 pitch 抬头 / 低头 |
 | `W/S` | 底盘前进/后退 |
 | `A/D` | 底盘左右平移 |
-| `←/→` | 底盘左转/右转 |
+| `Q/E` | 底盘左转/右转 |
 | `空格` | 全部停手 |
-| `e` / `f` | 云台 / 底盘使能 |
+| `g` / `f` | 云台 / 底盘使能 |
 | `x` | 急停（云台 + 底盘） |
 | `c` | 底盘里程计清零 |
 
@@ -273,13 +314,16 @@ pkill -x gimbal
 ```
 ⚠️ 别用 `pkill -f build/gimbal` —— 在远程 shell 里会把自己的 shell 也匹配掉。
 
-### 8.4 两个串口的区分
+### 8.4 串口的区分
 
 | 场景 | 设备 |
 |---|---|
-| F407 USART2（控制链路） | `/dev/ttyUSB0`（CH340） |
+| F407 USART2（控制链路）+ 云台 ZDT（共用一个 CH340） | `/dev/ttyUSB0` |
 | F407 USART1（调试打印） | `/dev/ttyACM0`（DAP-LINK 虚拟串口，笔记本上） |
-| 云台 ZDT 电机 | 需要**第二路**串口（`ttyUSB1` 或 Jetson 40-pin `ttyTHS1`） |
+| 底盘 CAN / 云台 CAN | `can0`（CANable 2.0；`/dev/ttyACM*` 编号随插拔变化，以 `ls /dev/ttyACM*` 为准） |
+
+> 2026-10-19 起底盘与云台**合并到同一个 CH340**（`UnifiedSerial` 单串口链路），
+> 不再需要第二路串口；需要时也可 `--yaw-can can0` 把 yaw 单独放 CAN。
 
 ### 8.4b 反馈帧全部解析失败 / 收不到帧
 
@@ -352,16 +396,30 @@ openocd -f interface/cmsis-dap.cfg -f target/stm32f4x.cfg \
 
 客户端里先用 `--tau 0.02` 试手感，抖了就回到 0.03~0.04。
 
+### 9.2 CAN 链路实测（2026-10-21，CANable 2.0 ↔ F407 `can_link`）
+
+| 项 | 结果 |
+|---|---|
+| 建立 | `sudo slcand -o -s8 -t hw /dev/ttyACM1 can0 && sudo ip link set can0 up` → `can0 UP` |
+| 反馈组 | `0x110~0x114` 每 ~9.2 ms 一组（≈100 Hz），组内延迟 ~100 µs（远小于 2 ms 承诺） |
+| 反馈解码 | 拼回 40 B，`valid=1`，status = `0x00D3`（IMU 在线+标定+驱动使能+LINK_OK） |
+| 组规则 | `CanFbGroup` 自检 [8] 全绿（顺序/乱序/缺帧/CRC 坏组/非反馈帧） |
+| 云台 ZDT | 扩展帧在发（`0x000100/0x000200 35/36 6B` 遥测轮询），但电机仍 UART 模式 → 无应答（待切 CAN 模式 + 1 Mbps） |
+
 ---
 
 ## 10. 代码位置
 
 | 内容 | 路径 |
 |---|---|
-| 底盘链路（Jetson） | `~/gimbal/include/gimbal/link/chassis_link.hpp` |
+| 底盘链路协议（Jetson） | `~/gimbal/include/gimbal/link/chassis_link.hpp` |
+| 单串口统一链路（UART 底盘 + ZDT 共线） | `~/gimbal/include/gimbal/link/unified_serial.hpp` / `src/link/unified_serial.cpp` |
+| CAN 底盘链路（SocketCAN） | `~/gimbal/include/gimbal/link/can_chassis_link.hpp` / `src/link/can_chassis_link.cpp` |
 | UDP 协议 v2 | `~/gimbal/include/gimbal/link/control_link.hpp` |
 | 主程序/接线逻辑 | `~/gimbal/src/main.cpp` |
 | 笔记本客户端 | `~/gimbal_ctl/src/main.cpp` |
-| F407 链路实现 | `~/stmproject/INTRA_SCHOOL_COMPETITION_27RM/UserLib/Comm/uart_link.{c,h,codec.h}` |
+| F407 串口链路实现 | `~/stmproject/INTRA_SCHOOL_COMPETITION_27RM/UserLib/Comm/uart_link.{c,h,codec.h}` |
+| F407 CAN 链路实现 | 同目录 `can_link.{c,h}` + `can_link_config.h`（协议与串口版一致） |
 | F407 协议常量 | 同目录 `uart_link_config.h` |
 | F407 台架工具 | 同仓库 `tools/uart_link_test.py`、`tools/codec_test.c` |
+| CAN 协议文档（帧表/组规则/联调） | 同仓库 `docs/CAN_CONTROL_PROTOCOL.md` |
