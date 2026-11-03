@@ -73,6 +73,16 @@ public:
     void zeroPosition();
     void clearStall();
 
+    // ---- 位置反馈（0x36）累积 ---------------------------------------
+    /// 位置反馈是否可用（收到过且新鲜）
+    bool hasPosFeedback(double timeout_s = 0.5) const {
+        return pos_ok_ && st_.age_s < timeout_s;
+    }
+    /// 相对 resetPosAccum() 的累积角度：电机轴，度，连续不绕圈
+    double posDegSigned() const { return pos_acc_deg_; }
+    /// 把当前位置记为 0°（只重设本类累积器，不发帧）
+    void   resetPosAccum();
+
     // ---- 周期 -------------------------------------------------------------
     /// 控制循环里调用：下发到期遥测 + 收帧更新状态。**不**负责 poll 传输层。
     void update();
@@ -116,6 +126,9 @@ private:
     double                        shadow_rpm_       = 0.0;
     std::chrono::steady_clock::time_point last_rx_tp_{};
     bool                          has_rx_tp_ = false;
+    bool                          pos_ok_      = false;   ///< 位置累积已初始化
+    int32_t                       pos_prev_    = 0;       ///< 上次带符号 16-bit 位置
+    double                        pos_acc_deg_ = 0.0;     ///< 累积角度（电机轴 °）
 };
 
 }  // namespace gimbal

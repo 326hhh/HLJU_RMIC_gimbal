@@ -52,6 +52,7 @@
 #include "gimbal/link/unified_serial.hpp"   // 底盘 + 云台共用一条串口
 #include "gimbal/link/can_chassis_link.hpp"  // SocketCAN 后端：底盘标准帧
 #include "gimbal/transport/can_transport.hpp"  // SocketCAN 后端：云台 ZDT 扩展帧
+#include "gimbal/device/fire_control.hpp"      // 水弹波箱：GPIO 火力控制（MOS 模块）
 
 using namespace gimbal;
 
@@ -62,6 +63,9 @@ static void onSignal(int) { g_run = false; }
 struct Options {
     std::string device     = "/dev/ttyUSB0";
     int         baud       = 115200;
+    std::string fire_script = "src/device/fire_worker.py";   ///< 波箱火力 worker 路径
+    int         fire_pin    = 12;                             ///< 火力 GPIO（BOARD 引脚号）
+    bool        no_fire     = false;                          ///< 不启动波箱火力进程
     uint8_t     yaw_addr   = 1;          ///< 实机接线：yaw 电机在 ID 1（原默认 2，与 pitch 互换）
     uint8_t     pitch_addr = 2;          ///< 实机接线：pitch 电机在 ID 2（暂未接入 CAN）
     bool        selftest   = false;
@@ -69,11 +73,13 @@ struct Options {
 
     /// 传动比 = 电机转数 / 输出轴转数（2:1 减速填 2.0）
     double      gear       = 2.0;
+    double      pitch_gear = 1.0;   ///< pitch 传动比：本机构直连无减速 -> 1.0
+
     /// 脉冲/【电机】圈 = 200 × 细分（细分 16 -> 3200）
     uint32_t    pulses_per_motor_rev = 3200;
 
     double      yaw_min = -180.0, yaw_max = 180.0,  yaw_rate = 180.0;
-    double      pitch_min = -45.0, pitch_max = 45.0, pitch_rate = 120.0;
+    double      pitch_min = -30.0, pitch_max = 30.0, pitch_rate = 120.0;   ///< 软限位：上抬 30° / 下压 30°
     bool        yaw_no_limit = true;     ///< 导电滑环：yaw 无机械限位
 
     int         acc        = 200;
@@ -98,9 +104,10 @@ static void usage(const char* a0) {
         "  --yaw-addr <n>         yaw 电机地址 (默认 1)\n"
         "  --pitch-addr <n>       pitch 电机地址 (默认 2)\n"
         "  --gear <f>             传动比=电机转数/输出转数 (默认 2.0)\n"
+        "  --pitch-gear <f>       pitch 传动比：直连填 1.0 (默认 1.0)\n"
         "  --pulses <n>           脉冲/电机圈 = 200×细分 (默认 3200)\n"
         "  --yaw-limit <a> <b>    给 yaw 启用软限位 (默认关闭)\n"
-        "  --pitch-limit <a> <b>  pitch 软限位 (默认 -45 45)\n"
+        "  --pitch-limit <a> <b>  pitch 软限位 (默认 -30 30)\n"
         "  --yaw-rate <dps>       yaw 最大角速度 (默认 180)\n"
         "  --pitch-rate <dps>     pitch 最大角速度 (默认 120)\n"
         "  --acc <0-255>          加速度档位 (默认 200)\n"
@@ -111,6 +118,9 @@ static void usage(const char* a0) {
         "  --yaw-can <iface>      仅 yaw 走 SocketCAN（如 can0），pitch 仍走 --device 串口\n"
         "  --chassis <serial|canX> 底盘后端：serial=与云台共用 --device（默认），can0=底盘走 CAN\n"
         "  --no-chassis           不接底盘（只控云台）\n"
+        "  --fire-script <f>      波箱火力 worker 路径 (默认 src/device/fire_worker.py)\n"
+        "  --fire-pin <n>         火力 GPIO BOARD 引脚号 (默认 12)\n"
+        "  --no-fire              不启动波箱火力进程\n"
         "  --selftest             自检后退出\n"
         "  -h, --help\n", a0);
 }
@@ -715,7 +725,7 @@ static int runMain(const Options& o) {
     gc.yaw.max_deg         = o.yaw_max;
 
     gc.pitch.name          = "pitch";
-    gc.pitch.gear_ratio    = o.gear;
+    gc.pitch.gear_ratio    = o.pitch_gear;
     gc.pitch.min_deg       = o.pitch_min;
     gc.pitch.max_deg       = o.pitch_max;
     gc.pitch.max_rate_dps  = o.pitch_rate;
@@ -742,6 +752,16 @@ static int runMain(const Options& o) {
         }
     }
 
+    // ---- 水弹波箱火力控制（MOS 模块，Jetson 40pin GPIO 12）----
+    std::unique_ptr<FireControl> fire;
+    if (!o.no_fire) {
+        fire.reset(new FireControl(o.fire_script, o.fire_pin));
+        if (!fire->ok()) {
+            std::printf("[main] 警告：波箱火力进程启动失败（云台/底盘不受影响）\n");
+            fire.reset();
+        }
+    }
+
     signal(SIGINT, onSignal);
     signal(SIGTERM, onSignal);
 
@@ -756,7 +776,7 @@ static int runMain(const Options& o) {
                 o.yaw_addr, o.gear,
                 o.yaw_no_limit ? "无限位(导电滑环)" : "有软限位", o.yaw_rate);
     std::printf("  pitch   : addr=%u 传动比 %.2f 限位[%.0f, %.0f] 最大 %.0f°/s\n",
-                o.pitch_addr, o.gear, o.pitch_min, o.pitch_max, o.pitch_rate);
+                o.pitch_addr, o.pitch_gear, o.pitch_min, o.pitch_max, o.pitch_rate);
     std::printf("  脉冲/电机圈=%u  加速度档位=%d\n", o.pulses_per_motor_rev, o.acc);
     std::printf("  控制频率: %.0f Hz   看门狗: %.1f s\n", o.loop_hz,
                 gc.command_timeout_s);
@@ -772,7 +792,7 @@ static int runMain(const Options& o) {
     }
     std::printf("--------------------------------------------------------\n");
     std::printf("  本地命令: y/p/r 角速度  h 停手  home 回中  zero 归零\n");
-    std::printf("            en 0|1 使能  x 急停  s 状态  q 退出\n");
+    std::printf("            en 0|1 使能  x 急停  s 状态  q 退出  f 1|0 开/停火\n");
     if (chassis)
         std::printf("  底盘命令: c <vx> <vy> <wz>（mm/s, mm/s, mrad/s）  cx 底盘急停\n");
     std::printf("========================================================\n");
@@ -797,6 +817,11 @@ static int runMain(const Options& o) {
                    std::chrono::steady_clock::now().time_since_epoch())
             .count();
     };
+
+    // ---- 发射扳机：UDP Fire 位（0.3s 内有效）或本地 f 命令 ----
+    bool   fire_cmd   = false;   // 最后一帧命令的扳机状态
+    double fire_cmd_s = -1e9;    // 该帧到达时刻
+    bool   local_fire = false;   // 本地 stdin f 命令
 
     while (g_run) {
         // ---- 1. 本地 stdin ----
@@ -824,6 +849,8 @@ static int runMain(const Options& o) {
             else if (cmd == "x" || cmd == "estop") { gimbal.estop(); local_has = false;
                                    std::printf("[cmd] 急停\n"); }
             else if (cmd == "s" || cmd == "status") { printStatus(gimbal, *yaw_bus, *pitch_bus, link.get(), chassis); }
+            else if (cmd == "f") { int v = 0; iss >> v; local_fire = (v != 0);
+                                   std::printf("[cmd] fire=%d\n", local_fire ? 1 : 0); }
             else if (cmd == "c") { iss >> local_cvx >> local_cvy >> local_cwz; local_c_has = true;
                                    std::printf("[cmd] 底盘 vx=%.0f vy=%.0f wz=%.0f\n",
                                                local_cvx, local_cvy, local_cwz); }
@@ -840,9 +867,12 @@ static int runMain(const Options& o) {
             ControlCommand cc;
             while (link->popCommand(cc)) {
                 echo_seq = cc.seq;
+                fire_cmd   = (cc.flags & ctrl_flag::Fire) != 0;
+                fire_cmd_s = now_s();
                 if (cc.estop()) {
                     gimbal.estop();
-                    local_has = false;
+                    local_has  = false;
+                    local_fire = false;      // 急停一并停火
                     continue;
                 }
                 if (cc.flags & ctrl_flag::Disable)      gimbal.enable(false);
@@ -905,6 +935,12 @@ static int runMain(const Options& o) {
             chassis->poll();
         }
 
+        // ---- 3c. 水弹波箱：UDP 扳机（0.3s 内有效）或本地 f 命令 ----
+        if (fire) {
+            const bool udp_fire = fire_cmd && (now_s() - fire_cmd_s) <= 0.30;
+            fire->setFire(local_fire || udp_fire);
+        }
+
         // ---- 4. 控制一拍 ----
         gimbal.step(dt_target);
 
@@ -926,6 +962,7 @@ static int runMain(const Options& o) {
     }
 
     std::printf("\n[main] 退出中：速度归零…\n");
+    if (fire) fire->setFire(false);
     gimbal.hold();
     for (int i = 0; i < 30; ++i) gimbal.step(dt_target);
     std::printf("[main] 电机保持使能（抱死）；如需松轴请手动失能\n");
@@ -956,6 +993,7 @@ int main(int argc, char** argv) {
         else if (a == "--yaw-addr")    o.yaw_addr = static_cast<uint8_t>(nexti(1));
         else if (a == "--pitch-addr")  o.pitch_addr = static_cast<uint8_t>(nexti(2));
         else if (a == "--gear")        o.gear = next(o.gear);
+        else if (a == "--pitch-gear")  o.pitch_gear = next(o.pitch_gear);
         else if (a == "--pulses")      o.pulses_per_motor_rev = static_cast<uint32_t>(nexti(3200));
         else if (a == "--yaw-limit")   { o.yaw_min = next(o.yaw_min); o.yaw_max = next(o.yaw_max);
                                          o.yaw_no_limit = false; }
@@ -970,6 +1008,9 @@ int main(int argc, char** argv) {
         else if (a == "--no-udp")      o.no_udp = true;
         else if (a == "--hz")          o.loop_hz = next(o.loop_hz);
         else if (a == "--no-chassis")   o.no_chassis = true;
+        else if (a == "--fire-script" && i + 1 < argc) o.fire_script = argv[++i];
+        else if (a == "--fire-pin" && i + 1 < argc)    o.fire_pin = nexti(o.fire_pin);
+        else if (a == "--no-fire")                     o.no_fire = true;
         else if (a == "--selftest")    o.selftest = true;
         else { std::printf("未知参数: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }

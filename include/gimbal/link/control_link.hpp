@@ -81,6 +81,7 @@ constexpr uint8_t Zero       = 0x08;
 constexpr uint8_t EStop      = 0x10;
 constexpr uint8_t ClearStall = 0x20;
 constexpr uint8_t Disable    = 0x40;   ///< 显式失能（与 Enable 互斥，Disable 优先）
+constexpr uint8_t Fire       = 0x80;   ///< 连射请求：按住=1，松开/断流=0（水弹波箱 MOS 控制）
 }  // namespace ctrl_flag
 
 // ---- status（下行）--------------------------------------------------------

@@ -95,6 +95,12 @@ void ZdtMotor::estop() {
 
 void ZdtMotor::zeroPosition() {
     transport_->send(zdt::mkZeroPos(cfg_.addr));
+    resetPosAccum();          // 电机内部计数已归零，累积器同步重设
+}
+
+void ZdtMotor::resetPosAccum() {
+    pos_ok_      = false;     // 下一个位置帧作为新的 0° 基准
+    pos_acc_deg_ = 0.0;
 }
 
 void ZdtMotor::clearStall() {
@@ -162,7 +168,7 @@ void ZdtMotor::handleFrame(const zdt::Frame& f) {
         case zdt::Func::GetSpeed: {
             if (f.data.size() < 4) break;
             const double rpm = static_cast<double>((f.data[1] << 8) | f.data[2]);
-            st_.speed_rpm = (f.data[0] != 0) ? -rpm : rpm;
+            st_.speed_rpm = (f.data[0] != 0) ? rpm : -rpm;   // dir 字节 1 = 正方向，与 setSpeedRpm 的 ccw 约定对齐
             if (cfg_.invert_dir) st_.speed_rpm = -st_.speed_rpm;
             st_.valid = true;
             break;
@@ -178,8 +184,24 @@ void ZdtMotor::handleFrame(const zdt::Frame& f) {
             st_.pos_raw = raw;
             // Emm 固件：0-65535 表示一圈 0-360°
             double deg = static_cast<double>(raw & 0xFFFFu) * 360.0 / 65536.0;
-            if (f.data[0] != 0) deg = -deg;   // 符号位
+            if (f.data[0] == 0) deg = -deg;   // dir=1 为正（与 setSpeedRpm 的 ccw 约定一致）
             st_.pos_deg = deg;
+            // ---- 累积成连续角度：软限位靠它，比转速积分可靠（不会漂）----
+            {
+                const int32_t mag = static_cast<int32_t>(raw & 0xFFFFu);
+                const int32_t cur = (f.data[0] != 0) ? mag : -mag;
+                if (!pos_ok_) {
+                    pos_prev_    = cur;
+                    pos_acc_deg_ = 0.0;          // 首个位置帧作为 0° 基准
+                    pos_ok_      = true;
+                } else {
+                    int32_t d = cur - pos_prev_;
+                    if (d >  32768) d -= 65536;  // 跨圈解绕
+                    if (d < -32768) d += 65536;
+                    pos_prev_     = cur;
+                    pos_acc_deg_ += static_cast<double>(d) * 360.0 / 65536.0;
+                }
+            }
             st_.valid   = true;
             break;
         }

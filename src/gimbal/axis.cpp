@@ -127,16 +127,21 @@ void Axis::update(double dt) {
     const double gear = (cfg_.gear_ratio > 1e-6) ? cfg_.gear_ratio : 1.0;
     motor_->setSpeedRpm(rate_act_ * gear / 6.0);
 
-    // ---- 7. 角度估计：优先用实测转速，无回帧时退化为指令值 ----
-    const auto& s = motor_->status();
-    double      rpm_used;
-    if (s.valid && s.age_s < 0.5) {
-        rpm_used = s.speed_rpm;                       // 电机实测 RPM
+    // ---- 7. 角度跟踪 ----
+    //        优先用 0x36 位置反馈累积（绝对基准、不会漂）；
+    //        没有位置帧时才退化为转速积分（会漂，仅兜底）。
+    if (motor_->hasPosFeedback()) {
+        est_angle_ = motor_->posDegSigned() / gear;   // 电机轴 ° -> 输出轴 °
     } else {
-        rpm_used = rate_act_ * gear / 6.0;            // 退化用指令值
+        const auto& s = motor_->status();
+        double      rpm_used;
+        if (s.valid && s.age_s < 0.5) {
+            rpm_used = s.speed_rpm;                   // 电机实测 RPM
+        } else {
+            rpm_used = rate_act_ * gear / 6.0;        // 退化用指令值
+        }
+        est_angle_ += (rpm_used * 6.0 / gear) * dt;
     }
-    // 电机 RPM -> 输出 °/s：×6 再除传动比
-    est_angle_ += (rpm_used * 6.0 / gear) * dt;
 
     // 软限位硬夹（即使估计漂了也不越界）
     if (cfg_.use_soft_limits) {
