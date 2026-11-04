@@ -1,7 +1,7 @@
 // ===========================================================================
 //  CAN 底盘链路：Jetson <-> F407（SocketCAN，标准帧）
 //
-//  协议见 docs/CAN_CONTROL_PROTOCOL.md（底盘仓库）：
+//  协议见底盘仓库 docs/README.md §15：
 //    0x000 广播急停（DLC=0，Jetson 发 / F407 只收）——最高优先级
 //    0x020 速度命令 100 Hz：cmd seq vx(i16) vy(i16) wz(i16 0.01rad/s)
 //    0x021 标志帧 10 Hz 保活 + flags 变化时立即发：flags(bit0 EN)

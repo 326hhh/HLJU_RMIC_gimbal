@@ -82,7 +82,7 @@
 | `sendFlagsFrame()` | 10 Hz 保活 + `enable` 变化时**立即**发一次 |
 
 帧表 / 组完整性规则 / 语义细节（`0x021` 不计 `cmd_cnt`、`CAN_ERR` 实时位）见底盘仓库
-`docs/CAN_CONTROL_PROTOCOL.md`。
+`docs/README.md` §15。
 
 ## 6. `UnifiedSerial` —— 单串口统一链路（UART）
 

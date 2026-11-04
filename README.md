@@ -1,145 +1,122 @@
-# gimbal —— 麦轮小车云台 + 底盘控制器
+# gimbal —— 麦轮小车云台 + 底盘控制器（Jetson Nano）
+
+> 本文件由原 `README.md`、`CHASSIS_LINK.md`、`DEBUG_REPORT_2026-10-19.md` **合并精简**而成
+> （2026-11-05）：工程概览与设计决策、底盘链路协议与排障、图传与无线、联调实测全部收在这一份里。
+> 各目录的逐文件说明仍在 `include/gimbal/README.md`、`src/README.md` 等子文档中。
 
 两轴云台（yaw + pitch）+ 底盘（STM32F407）的正式控制工程，跑在 Jetson Nano 上。
 
 **云台**：ZDT X42S 闭环步进 ×2，UART（CH340，与底盘共用一个串口）或 **CAN 扩展帧** 两种后端；
 **底盘**：F407 标准帧链路，**UART（`UnifiedSerial`，与云台共用一个串口）或 CAN（`CanChassisLink`）** 双后端可选。
-两种总线可任意组合，见 §7。
+两种总线可任意组合，见 §2.2。
 
 | 项 | 值 |
 |---|---|
 | 平台 | Jetson Nano（L4T R32.6.1 / Ubuntu 20.04 / kernel 4.9.253-tegra） |
-| 语言 | **C++17**（g++ 8.4.0） |
-| 构建 | CMake 3.16.3 |
+| 语言 / 构建 | **C++17**（g++ 8.4.0）+ CMake 3.16.3，单进程守护式，无 RTOS / ROS |
 | 云台电机 | ZDT X42S 第二代闭环步进 ×2，**Emm5.0 固件** |
-| 电机地址 | **yaw = 2**，**pitch = 1** |
+| 电机地址 | **yaw = 1**，**pitch = 2**（实机接线；早期文档写的 2/1 已作废） |
 | 细分 / 脉冲 | 细分 **16** → **3200 脉冲/电机圈** |
-| 传动比 | **2:1**（电机转 2 圈 = 输出轴 1 圈） |
-| 机械限位 | **yaw 有导电滑环，360° 无机械限位**；pitch 有软限位 |
+| 传动比 | yaw **2:1**（`--gear 2.0`）；pitch **直连 1:1**（`--pitch-gear 1.0`） |
+| 机械限位 | **yaw 有导电滑环，360° 无机械限位**；pitch 软限位 **−30° ~ +30°** |
 | 云台总线 | UART 115200 8N1（CH340）/ SocketCAN（`can0`，ZDT 扩展帧） |
 | 底盘总线 | USART2 115200 8N1（与云台共用一个 CH340）/ SocketCAN（`can0`，标准帧） |
 | 控制入口 | **UDP 40001**（PC 客户端）/ stdin（本地调试） |
 | 图传 | `mjpeg_server`：V4L2 取 MJPG → HTTP multipart，端口 **8080** |
+| 水弹波箱 | 可选：fork 一个 Python worker 用 Jetson GPIO 直驱 MOS（§9） |
+| 外部依赖 | **零第三方库** —— 仅 C++ 标准库 + Linux 系统调用（termios / SocketCAN / BSD socket） |
 
 ---
 
-## 1. 快速开始
+## 1. 系统拓扑
+
+```
+笔记本(PC)                            Jetson Nano                          STM32F407
+┌──────────────┐   WiFi 或 网线      ┌──────────────┐   串口(115200) ┌────────────┐
+│ gimbal_ctl   │ ──── UDP ────►    │ gimbal       │ ─── USART2 ──► │ uart_link  │
+│ (C++17, X11) │  24B/64B          │ (C++17 守护) │  PD5(TX)/PD6(RX)│ (1kHz 控制)│
+└──────────────┘                    └──────────────┘  └── 或 CAN ──► │ can_link   │
+                                         │  CH340 → ZDT 步进 ×2（云台，与底盘共线）└────────────┘
+                                         │  CANable → can0（底盘；ZDT 切 CAN 模式后也可上）
+                                         │  GPIO 12 → MOS（水弹波箱，可选）
+```
+
+| 角色 | 设备 / 端口 | 说明 |
+|---|---|---|
+| 笔记本 ↔ Jetson（有线） | `enp8s0 192.168.2.1` ↔ `eth0 192.168.2.2` | `ssh Jetson`（免密） |
+| 笔记本 ↔ Jetson（无线） | 笔记本 WiFi ↔ Jetson AP `MECAR-CTRL` / `10.42.0.1` | 车要走位时用这条 |
+| Jetson ↔ F407 / ZDT（串口） | `/dev/ttyUSB0`（CH340）115200 8N1 | 底盘 + 云台**共用一条** CH340 |
+| Jetson ↔ F407（CAN） | CANable 2.0 → `can0`，1 Mbps 标准帧 | 底盘 CAN 链路（§8.2） |
+| 笔记本 ↔ F407（调试） | `/dev/ttyACM0`（DAP-LINK 虚拟串口） | USART1 调试打印，115200 |
+| UDP 控制口 | `40001`（默认） | `gimbal_ctl` → `gimbal` |
+| 图传 | `:8080/stream` | MJPEG |
+
+---
+
+## 2. 快速开始
+
+### 2.1 构建与自检
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-ctest --test-dir build          # = ./build/gimbal --selftest，纯软件自检
+ctest --test-dir build          # = ./build/gimbal --selftest，纯软件 9 段自检
+```
 
-# 典型后端组合（详见 §7）
-./build/gimbal --device /dev/ttyUSB0            # 默认：全串口，底盘 + 云台共用同一个 CH340
+### 2.2 典型后端组合
+
+```bash
+./build/gimbal --device /dev/ttyUSB0               # 默认：全串口，底盘 + 云台共用同一个 CH340
 ./build/gimbal --device /dev/ttyUSB0 --no-chassis  # 只控云台
-./build/gimbal --chassis can0                   # 混合：云台 UART + 底盘 CAN（推荐先跑这个）
-./build/gimbal --device can0                    # 全 CAN：两轴 ZDT 扩展帧 + 底盘标准帧同一条 can0
-./build/gimbal --yaw-can can0                   # 仅 yaw 走 CAN，pitch + 底盘仍走串口
-./build/gimbal --selftest                       # 自检后退出（不接硬件）
+./build/gimbal --chassis can0                      # 混合：云台 UART + 底盘 CAN（推荐先跑这个）
+./build/gimbal --device can0                       # 全 CAN：两轴 ZDT 扩展帧 + 底盘标准帧同一条 can0
+./build/gimbal --yaw-can can0                      # 仅 yaw 走 CAN，pitch + 底盘仍走串口
+./build/gimbal --selftest                          # 自检后退出（不接硬件）
 ```
 
 > CAN 后端需要先起 `can0`（CANable 2.0，SLCAN 固件）：
 > `sudo slcand -o -s8 -t hw /dev/ttyACM1 can0 && sudo ip link set can0 up`
 > （`ttyACM*` 编号随插拔变化，以 `ls /dev/ttyACM*` 为准）。
 
-**交互命令**（标准输入，一行一条）：
+### 2.3 启动 / 停止 / 查后台
 
-| 命令 | 作用 |
-|---|---|
-| `y <dps>` | 设 yaw 角速度（°/s，正 = 角度增大） |
-| `p <dps>` | 设 pitch 角速度 |
-| `r <y> <p>` | 同时设两轴 |
-| `h` / `hold` | 停手（**保持使能**，抱死） |
-| `home` | 回中 |
-| `zero` | 把当前位置当作 0°（应在机械零点执行） |
-| `en 0\|1` | 使能 / 失能 |
-| `x` / `estop` | 急停（立即停止 + 失能） |
-| `s` | 打印状态 |
-| `q` | 退出 |
-
-**命令行参数**（`-h` 可打印）：
-
-```
---device <路径>        串口设备 (默认 /dev/ttyUSB0)
---baud <n>             波特率 (默认 115200)
---yaw-addr <n>         yaw 电机地址 (默认 2)
---pitch-addr <n>       pitch 电机地址 (默认 1)
---gear <f>             传动比=电机转数/输出转数 (默认 2.0)
---pulses <n>           脉冲/电机圈 = 200×细分 (默认 3200)
---yaw-limit <a> <b>    给 yaw 启用软限位 (默认关闭)
---pitch-limit <a> <b>  pitch 软限位 (默认 -45 45)
---yaw-rate <dps>       yaw 最大角速度 (默认 180)
---pitch-rate <dps>     pitch 最大角速度 (默认 120)
---acc <0-255>          加速度档位 (默认 200)
---ctrl-port <n>        UDP 控制口 (默认 40001)
---no-udp               不开 UDP（只用本地 stdin）
---hz <n>               控制频率 (默认 100)
---can <iface>          SocketCAN 后端（如 can0；等价 --device can0，两轴同总线）
---yaw-can <iface>      仅 yaw 走 SocketCAN（如 can0），pitch 仍走 --device 串口
---chassis <serial|canX> 底盘后端：serial=与云台共用 --device（默认），can0=底盘走 CAN
---no-chassis           不接底盘（只控云台）
---selftest             自检后退出
-```
-
-> 已移除 `--dry`（模拟电机跑交互，FakeTransport 现仅用于 `--selftest`）与
-> `--chassis-dev/--chassis-baud`（底盘不再单独占口，与云台共用 `--device`）。
-
-### 启动 / 停止 / 查后台（jetson@nano:~/gimbal$）
-
-**启动（前台，推荐）**——能看到状态、能用交互命令：
+**前台（推荐）**——能看到状态、能用交互命令：
 
 ```bash
 jetson@nano:~/gimbal$ ./build/gimbal --device /dev/ttyUSB0
 ```
 
-**启动（后台）**——关终端也不退出：
+**后台**——关终端也不退出：
 
 ```bash
-jetson@nano:~/gimbal$ nohup ./build/gimbal --device /dev/ttyUSB0 > /tmp/gimbal.log 2>&1 < /dev/null &
-jetson@nano:~/gimbal$ tail -f /tmp/gimbal.log        # 看日志
+nohup ./build/gimbal --device /dev/ttyUSB0 > /tmp/gimbal.log 2>&1 < /dev/null &
+tail -f /tmp/gimbal.log        # 看日志
 ```
 
-> 后台方式的 stdin 是空的，`s`/`q` 等交互命令用不了；想用就前台跑。
-
-**停止**
+> 后台方式的 stdin 是空的，`s` / `q` 等交互命令用不了；想用就前台跑。
 
 | 场景 | 命令 |
 |---|---|
-| 前台跑的 | 在终端按 `q`（优雅退出，会先停手/停车）或 `Ctrl+C` |
+| 前台跑的 | 终端按 `q`（优雅退出，会先停手/停车）或 `Ctrl+C` |
 | 后台跑的 | `kill <PID>`（PID 用 `pgrep -af 'build/gimbal'` 查） |
 | 按名字杀 | `pkill -f 'build/gimbal'` |
 | 卡死最后手段 | `kill -9 <PID>`（可能来不及收尾，慎用） |
 
+查：`pgrep -af 'build/gimbal'` · `fuser -v /dev/ttyUSB0`（谁占着串口）· `ss -uln | grep 40001` · `tail -f /tmp/gimbal.log`
+
 > ⚠️ **串口是独占的**：旧进程没退干净就起新的，新的会打不开 `/dev/ttyUSB0`。顺序永远是先关旧、再开新。
-
-**查后台**
-
-| 目的 | 命令 |
-|---|---|
-| gimbal 在不在跑 | `pgrep -af 'build/gimbal'` |
-| 谁占着串口 | `fuser -v /dev/ttyUSB0` 或 `lsof /dev/ttyUSB0` |
-| 谁监听 UDP 40001 | `ss -uln \| grep 40001` |
-| 看后台日志 | `tail -f /tmp/gimbal.log` |
-
-**一条龙**：
-
-```bash
-jetson@nano:~/gimbal$ pgrep -af 'build/gimbal'              # 查
-jetson@nano:~/gimbal$ kill $(pgrep -f 'build/gimbal')       # 关
-jetson@nano:~/gimbal$ ./build/gimbal --device /dev/ttyUSB0   # 开
-```
+> ⚠️ 远程 shell 里**别用** `pkill -f build/gimbal` 之外的模糊匹配，`pkill -f gimbal` 会把自己的 shell 一起杀掉。
 
 ---
 
-## 2. 目录结构
+## 3. 目录结构
+
+**26 个源文件（14 头 + 12 源）/ 5056 行**，另加 `CMakeLists.txt`、`README.md` 与 `src/device/fire_worker.py`。
 
 ```
-gimbal/                             25 个源文件 / 约 4900 行 + 3 份文档
+gimbal/
 ├── CMakeLists.txt                   构建脚本：gimbal_core 静态库 + gimbal / mjpeg_server 两个可执行
-├── README.md                        本文（概览 / 设计决策 / 踩坑）
-├── CHASSIS_LINK.md                  底盘链路 + 图传 + 无线连接 的使用与排障手册
-├── DEBUG_REPORT_2026-10-19.md       2026-10-19 联调记录（单串口合并 / 无线 / IMU 修复，历史留档）
+├── README.md                        本文（概览 / 设计决策 / 链路协议 / 操作 / 排障 / 实测）
 │
 ├── include/gimbal/                  ── 头文件：接口与线协议 ──
 │   ├── protocol/                    ZDT（张大头）闭环步进电机线协议
@@ -148,9 +125,10 @@ gimbal/                             25 个源文件 / 约 4900 行 + 3 份文档
 │   ├── transport/                   与总线无关的收发层（换总线只换这里）
 │   │   ├── itransport.hpp           ★ 抽象接口：12 ms 发送节流队列 + 收帧队列 + 统计
 │   │   ├── can_transport.hpp        SocketCAN 实现（29-bit 扩展帧拆包重组，ZDT 云台用）
-│   │   └── fake_transport.hpp       纯软件电机模拟（--selftest 用，无需硬件）
+│   │   └── fake_transport.hpp       纯软件电机模拟（`--selftest` 用，无需硬件）
 │   ├── device/
-│   │   └── zdt_motor.hpp            单台电机：使能 / 速度 / 位置 / 急停 / 遥测轮询
+│   │   ├── zdt_motor.hpp            单台电机：使能 / 速度 / 位置 / 急停 / 遥测轮询
+│   │   └── fire_control.hpp         水弹波箱：fork/exec Python worker，经管道发 `0`/`1`
 │   ├── gimbal/
 │   │   ├── axis.hpp                 单轴控制律：角速度斜坡 + 死区 + 软限位 + 回中 + 角度估计
 │   │   └── gimbal.hpp               双轴协调：统一时钟 + 两级看门狗 + 传输层 poll 去重
@@ -169,7 +147,9 @@ gimbal/                             25 个源文件 / 约 4900 行 + 3 份文档
     │   ├── itransport.cpp           节流队列、收帧按地址路由、统计维护
     │   └── can_transport.cpp        SocketCAN 收发 + 扩展帧拆包重组
     ├── device/
-    │   └── zdt_motor.cpp            物理量 ↔ ZDT 帧、遥测解析、传动比/脉冲换算
+    │   ├── zdt_motor.cpp            物理量 ↔ ZDT 帧、遥测解析、传动比/脉冲换算
+    │   ├── fire_control.cpp         fork/exec + 管道写 `1\n`/`0\n`，析构写 `0\nq\n`
+    │   └── fire_worker.py           水弹波箱节拍进程（BOARD 引脚 12，高 80 ms / 低 120 ms）
     ├── gimbal/
     │   ├── axis.cpp                 单轴控制律（斜坡/死区/限位/回中）
     │   └── gimbal.cpp               双轴调度、看门狗、estop/home/enable 协调
@@ -181,20 +161,19 @@ gimbal/                             25 个源文件 / 约 4900 行 + 3 份文档
         └── mjpeg_server.cpp         独立程序：V4L2 取 MJPG 帧 → HTTP multipart 转发（零转码）
 ```
 
-> 行数分布（判断改动影响面用）：
-> `main.cpp` 978 · `unified_serial.cpp` 356 · `can_chassis_link.cpp` 278 · `mjpeg_server.cpp` 401 ·
-> `zdt_motor.cpp` 221 · `zdt_frame.cpp` 200 · `udp_control_link.cpp` 175 · `can_transport.cpp` 179 ·
-> `axis.cpp` 148 · `gimbal.cpp` 111 · `itransport.cpp` 77。
-> 头文件：`control_link.hpp` 346 · `chassis_link.hpp` 194 · `can_chassis_link.hpp` 121 ·
-> `unified_serial.hpp` 146 · `itransport.hpp` 91 · `fake_transport.hpp` 204 · `udp_control_link.hpp` 75 ·
-> `can_transport.hpp` 61 · `zdt_motor.hpp` 121 · `axis.hpp` 94 · `gimbal.hpp` 89 ·
-> `zdt_codes.hpp` 104 · `zdt_frame.hpp` 97。
->
+行数分布（判断改动影响面用）：
+`main.cpp` 1019 · `unified_serial.cpp` 356 · `mjpeg_server.cpp` 401 · `can_chassis_link.cpp` 278 ·
+`zdt_motor.cpp` 243 · `zdt_frame.cpp` 200 · `can_transport.cpp` 179 · `udp_control_link.cpp` 175 ·
+`axis.cpp` 153 · `gimbal.cpp` 111 · `itransport.cpp` 77 · `fire_control.cpp` 76 ·
+头文件：`control_link.hpp` 347 · `fake_transport.hpp` 204 · `chassis_link.hpp` 194 · `unified_serial.hpp` 146 ·
+`zdt_motor.hpp` 134 · `can_chassis_link.hpp` 121 · `zdt_codes.hpp` 104 · `zdt_frame.hpp` 97 · `axis.hpp` 94 ·
+`itransport.hpp` 91 · `gimbal.hpp` 89 · `udp_control_link.hpp` 75 · `can_transport.hpp` 61 · `fire_control.hpp` 31。
+
 > ★ = 协议/接口的关键文件，改动要三端（固件 ↔ Jetson ↔ PC 客户端）同步。
 
 ---
 
-## 3. 分层设计
+## 4. 分层设计
 
 ```
    main.cpp  ──  控制循环 100Hz + stdin 交互 + 底盘仲裁
@@ -222,21 +201,54 @@ gimbal/                             25 个源文件 / 约 4900 行 + 3 份文档
 
 **换总线只换一个实现类**，上层一行不用改。
 
-### 3.5 传动比（**最容易被忽略、但会全盘算错**）
-
-`--gear` 是 **电机转数 / 输出轴转数**（2:1 减速填 2.0）。它影响两处：
+### 4.1 单拍数据流（100 Hz，dt = 10 ms）
 
 ```
-输出 °/s  ->  电机 RPM :  rpm = dps × gear / 6       （2:1 时 90°/s -> 30 RPM）
+操作端 UDP 包 ─┐
+               ├─► Gimbal::setRate(yaw_dps, pitch_dps)
+本地 stdin ────┘         │
+                         ▼
+                   Axis::setRate()  ── 限幅到 max_rate_dps，重置 since_cmd_s_
+                         │
+                         ▼
+                   Axis::update(dt) ── ① 看门狗判断
+                                        ② 斜坡逼近（rate_accel_dps2）
+                                        ③ 死区吸收（rate_deadband_dps）
+                                        ④ 软限位钳制 + 角度积分
+                         │
+                         ▼
+        输出 °/s ──换算──► 电机 RPM（× gear ÷ 6）
+                         │
+                         ▼
+                   ZdtMotor::setSpeedRpm() ──► ITransport::send()
+                                                    │  12 ms 节流队列
+                                                    ▼
+                                              UART / CAN ──► 驱动板
+
+收方向：UART 字节 ─► zdt::Parser 流式切帧 ─► 按 Addr 路由
+        ─► ZdtMotor 解析（速度/角度/状态/电压/温度）─► Axis / Gimbal 查询
+        ─► main 组装 ControlTelemetry ─► UDP 下行 50 Hz
+```
+
+`Gimbal` 只对**去重后**的传输层调 `poll()`（两轴共一根总线时只有一个），避免同一串口被 poll 两次。
+
+### 4.2 传动比换算（最容易被忽略、但会全盘算错）
+
+`--gear` 是 **电机转数 / 输出轴转数**（yaw 的 2:1 减速填 `2.0`；pitch 直连填 `1.0`）：
+
+```
+输出 °/s  ->  电机 RPM :  rpm = dps × gear / 6       （yaw 2:1 时 90°/s -> 30 RPM）
 电机 RPM  ->  输出 °/s :  dps = rpm × 6 / gear
 脉冲/输出圈              :  3200 × gear = 6400
 ```
 
-自检里有断言：`90°/s @ gear=2.0 -> 电机 30.0 RPM`。
+自检里有断言：`90°/s @ gear=2.0 → 电机 30.0 RPM`。
 
-## 4. 关键设计决策（都来自实测踩坑）
+---
 
-### 4.1 命令节流 12 ms —— 防 ZDT 粘包
+## 5. 关键设计决策（都来自实测踩坑）
+
+### 5.1 命令节流 12 ms —— 防 ZDT 粘包
 
 ZDT 手册 §3.5.2：「每条命令发送完后，要延时几毫秒，防止命令之间粘包失效」
 
@@ -247,67 +259,74 @@ ZDT 手册 §3.5.2：「每条命令发送完后，要延时几毫秒，防止�
 | **0 ms** | **1/5** ❌ |
 | ≥1 ms | 5/5 ✅ |
 
-本工程取 **12 ms** 留足余量。实现在 `ITransport::nextTx()`。
+本工程取 **12 ms** 留足余量，实现在 `ITransport::nextTx()`（CAN 侧无粘包问题，取 2 ms）。
 
-### 4.2 `urgent` 是插队，**不是清空队列**
+### 5.2 `urgent` 是插队，**不是清空队列**
 
 踩过的坑：把 `urgent` 实现成 `txq_.clear()`，导致 `Gimbal::estop()` 里
 `yaw_.estop()` 排入的「失能」命令，被紧跟着的 `pitch_.estop()` 的 clear 直接清掉
-—— **yaw 永远没被失能**。一根总线挂多台电机时这是致命的。
+—— **yaw 永远没被失能**（自检里表现成 `yaw.en=1 pitch.en=0`）。一根总线挂多台电机时这是致命的。
 
 正确语义：`push_front()` 插队到最前，绝不动别人的命令。
 
-### 4.3 遥测轮询每项独立计时
+### 5.3 遥测轮询每项独立计时
 
 不能用轮转指针 `next = (next+1) % N` —— 遇到长周期项会卡住等一整拍，
 表现为「状态冻结几秒 → 猛跳一次」（实测回帧率从应有的 11.5/s 掉到 2.5/s）。
 
-`ZdtMotor` 里每个遥测项各持一个 `next_ms`，且初始值错开 5ms 避免同拍成簇。
+`ZdtMotor` 里每个遥测项各持一个 `next_ms`，且初始值错开 5 ms 避免同拍成簇。
 
-### 4.4 看门狗分两级，且**只归零不失能**
+### 5.4 看门狗分两级，且**只归零不失能**
 
 | 级别 | 触发条件 | 动作 |
 |---|---|---|
-| 手感层 | `rate_hold_s`(0.12s) 无新指令 | 角速度指数衰减到 0 |
-| 安全层 | `command_timeout_s`(0.5s) 无指令 | 强制 hold，**保持使能** |
+| 手感层 | `rate_hold_s`(0.12 s) 无新指令 | 角速度指数衰减到 0（τ = 0.05 s） |
+| 安全层 | `command_timeout_s` 无指令 | 强制 hold，**保持使能** |
 
 **为什么不失能**：云台一旦失能就松轴，受重力会垂下来 —— 比继续转更危险。
+断流 0.9 s 实测状态字 `0x0F`（含 `Watchdog`），速度归零而 `Enabled` 位仍在，符合设计。
 
-### 4.5 `Gimbal::enable()` 必须幂等 ⭐
+### 5.5 `Gimbal::enable()` 必须幂等 ⭐
 
 操作端**每个控制包**都会带 `Enable` 标志（意思是"保持使能"）。
-如果 `enable(true)` 每次都把 `enable_age_s_` 清零，`enable_delay_s`（上电空档）
-就永远走不完，两轴会被永久压在 `hold()` 上 —— **表现是"发什么都是 0，但状态全绿"**。
-这个坑实地踩过一次，排查花了很久。
+如果 `enable(true)` 每次都把 `enable_age_s_` 清零，`enable_delay_s`（上电空档）就永远走不完，
+两轴会被永久压在 `hold()` 上 —— **表现是"发什么都是 0，但状态全绿"**。这个坑实地踩过一次，
+最后靠独立 Python 实现交叉验证才排除协议问题。修法：`if (on == enabled_) return;`
+**协议里「每包都带的保持位」必须做成幂等操作。**
 
-### 4.6 UDP 操作端链路
+### 5.6 显式 `Disable` 标志
 
-线协议见 `include/gimbal/link/control_link.hpp`（**v2：上行 24 字节 / 下行 64 字节**，
-v1 的 16/32 字节旧帧仍可解码）。两端**必须逐字节一致**，用显式字节偏移写编解码，不依赖结构体 padding。
+最初只有 `Enable`，操作端**没法显式失能**（「不发送」≠「失能」）。
+补上 `flags` 位 `0x40 Disable`，与 `Enable` 互斥且优先。
 
-`UdpControlLink` 是**单线程非阻塞**的：`poll()` 在控制循环里被调用，
-不额外开线程 —— 控制循环本来就要跑 100Hz，顺手收包即可。遥测按 50 Hz 回发。
+### 5.7 单串口统一链路 `UnifiedSerial`（三机挂一条 CH340）
 
-### 4.7 CAN 底盘链路：组规则 + TX 队列
+一块 CH340 上挂三块 MCU：F407（底盘）+ ZDT yaw + ZDT pitch（云台）。
 
-- **`0x110~0x114` 五帧不是原子的**：`CanFbGroup` 按「`0x110` 开组 → 按序填入 → 下一个
-  `0x110` 冲掉未满组 → 组超时 5 ms 丢弃 → CRC8 失败整组丢弃」拼装，坏组绝不输出半帧。
-- **F407 只有 3 个发送邮箱**：F407 侧用 20 帧深 TX 队列连续发（组内 ≤2 ms），
-  Jetson 侧 10 ms 周期收到即收，组超时设 5 ms 有 2.5 倍余量。
-- **`0x021` 是标志帧不是命令帧**：EN=0 立即停车，但 F407 侧不计入 `cmd_cnt`、不刷新看门狗。
-- 详细帧表 / 语义 / 联调记录见底盘仓库 `docs/CAN_CONTROL_PROTOCOL.md`。
+```
+Jetson CH340 TX ──→ F407 USART2_RX + ZDT yaw RX + ZDT pitch RX
+Jetson CH340 RX ←── F407 USART2_TX + ZDT yaw TX + ZDT pitch TX   （三机共线）
+```
 
-### 4.8 同步运动预留
+`UnifiedSerial` 同时实现 `ITransport`（云台）与 `IChassisLink`（底盘），独占一个 fd：
 
-ZDT 支持两种双轴同步（手册 §3.5.2）：
-- **多机同步标志**：两轴各发带 `sync=01` 的命令（先缓存不动），再广播 `00 FF 66 6B` 触发同时运动
-- **多电机命令**（X42S/Y42 专属）：`AA <总长> <cmd1> <cmd2> …` 一条发完
+- **RX 按帧边界分流（`RxDemux`）**：不是把同一堆字节喂给两个解析器（那样底盘反馈帧里的字节可能
+  被 ZDT 解析器误拆成假帧），而是按帧切流：
+  `5A A5 81` + 36 B + CRC8 + `0D`（共 40 B）→ 底盘解码器；`Addr(1..32)` + `Func` + 负载 + `0x6B` → ZDT 帧队列；
+  其余字节滚 1 字节重同步（与 F407 固件 `ulink_parse_rx` 同策略）。
+- **发送**（同一 fd，整块写不交错）：底盘命令 12 B / **5 ms** 节流；ZDT 命令 **12 ms** 节流，
+  并尽量排在**底盘反馈后的静默窗**（收完反馈 ≤6 ms 内发），避免 ZDT 应答与 F407 反馈在 RX 线上打架。
+- **`poll()` 幂等**：主循环的 `chassis->poll()` 与 `Gimbal::step()` 内部的 poll 在同一拍会各调一次，
+  用 1 ms 去重保证一拍只完整跑一次。
+- **时效**：`state().age_s > chassis_timeout_s`(0.3 s) → `valid=0`；断线 0.5 s 自动重连。
 
-当前是速率控制，暂时用不到；做位置模式时再接入。
+> ⚠️ **已知限制：三机 TX 并线的抢线**。F407 反馈（100 Hz，每帧占线 3.5 ms）和 ZDT 应答都往
+> CH340 的 RX 上发，同一时刻两个从机同时发字会冲突。静默窗调度能缓解（表现为客户端底盘偶发
+> `OFFLINE`，不影响控制），物理根治需 485 收发器，或把 ZDT 遥测轮询周期放宽到 250 ms。
 
 ---
 
-## 5. ⚠️ 单位换算是个坑（务必看懂）
+## 6. ⚠️ 单位换算是个坑（务必看懂）
 
 **Emm 固件与 X 固件的位置模式单位完全不同**：
 
@@ -318,18 +337,30 @@ ZDT 支持两种双轴同步（手册 §3.5.2）：
 | 位置回读 `0x36` | **0-65535 = 一圈 0-360°** | 角度/10 |
 | 位置模式帧长 | 13 字节 | 不同（见手册 §5.3.10） |
 
-所以 Emm 固件下：
-```
-脉冲数 = 角度/360 × (200 × 细分)
-```
-`--pulses` 必须按**驱动板实际细分**设置。默认填 3200（200×16），
-**联调前请用 `42` 读驱动参数确认**（第 9 字节是 Microsteps）。
+所以 Emm 固件下：`脉冲数 = 角度/360 × (200 × 细分)`，`--pulses` 必须按**驱动板实际细分**设置，
+默认 3200（200×16），**联调前请用 `42` 读驱动参数确认**（第 9 字节是 Microsteps）。
 
-本工程默认走**速度模式**做控制，天然绕开这个换算问题。
+本工程默认走**速度模式**做控制，天然绕开这个换算问题；位置模式只实现了 Emm 分支。
+
+**角度估计的诚实边界**：`0x36` 只有单圈值，`Axis::estAngleDeg()` 是靠转速积分出来的软件估计、会缓慢漂移。
+真正的绝对保护应依赖驱动板的限位开关输入（状态位 `bit4/bit5`），或定期 `zeroHere()` 在机械零点重新对齐。
+
+**用到的功能码**（`protocol/zdt_codes.hpp`）：
+
+| 码 | 名称 | 作用 | 码 | 名称 | 作用 |
+|---|---|---|---|---|---|
+| `F3` | Enable | 使能 / 失能 | `36` | GetPos | 实时位置回读 |
+| `F6` | Speed | 速度模式 | `3A` | GetStatus | 状态标志位 |
+| `FD` | Position | 位置模式 | `39` | GetTemp | 驱动温度 |
+| `FE 98` | EStop | 立即停止 | `24` | GetVbus | 母线电压 mV |
+| `FF 66` | SyncMove | 多机同步触发 | `42` | GetConfig | 驱动参数（33 B） |
+| `35` | GetSpeed | 实时转速回读 | `0A` | ZeroPos | 当前位置清零 |
+
+`0x3A` 状态位：`bit0` 使能 · `bit1` 到位 · `bit2` 堵转 · `bit3` 堵转保护 · `bit4` 左限位 · `bit5` 右限位 · `bit7` 掉电。
 
 ---
 
-## 6. 自检覆盖范围
+## 7. 自检覆盖范围（`--selftest` / `ctest`）
 
 `--selftest` 不需要任何硬件，共 **9 段**：
 
@@ -338,105 +369,481 @@ ZDT 支持两种双轴同步（手册 §3.5.2）：
 | [1] 帧构造 | `mkEnable/mkSpeed/mkEStop/mkGet/mkPositionEmm` 逐字节比对期望 hex |
 | [2] 解析器 | 混入垃圾字节后仍能正确切帧 + 校验 |
 | [3] 角度↔脉冲 | 360°→3200、90°→800（用 FakeTransport 构造 ZdtMotor） |
-| [4] UDP 线协议 | 上行 24B / 下行 64B 编解码往返、坏包/短包被拒 |
+| [4] UDP 线协议 | 上行 24 B / 下行 64 B 编解码往返、坏包/短包被拒 |
 | [5] 端到端 | 一总线双电机 + 传动比 2:1：地址路由、斜坡、使能、遥测、看门狗（触发但**不失能**）、软限位、急停后失能 |
 | [6] 底盘协议 | 命令帧编码向量、反馈帧解码向量、单字节破坏被拒、急停帧 cmd=0x02 且不带 EN |
 | [7] 单总线帧分流 | `RxDemux` 半包/逐字节喂入、底盘帧 + ZDT 帧交错、垃圾字节、无坏帧 |
 | [8] CAN 反馈组拼装 | `CanFbGroup`：0x110~0x114 顺序/乱序/缺帧/CRC 坏组/非反馈帧 |
 | [9] 混合传输 | yaw 走 CAN、pitch 走 UART（两轴不同总线），命令/回读各自落在正确总线 |
 
-## 7. 底盘链路（已实现，UART + CAN 双后端）
+---
 
-`include/gimbal/link/chassis_link.hpp`：`IChassisLink` 抽象 + `ChassisCommand` / `ChassisState` +
-帧编解码纯函数（与 F407 `UserLib/Comm/uart_link_config.h` **逐字节一致**）。
+## 8. 底盘链路
 
-```cpp
-struct ChassisCommand { double vx_mmps, vy_mmps, wz_mradps; bool enable, estop, clear_odom; };
-struct ChassisState   { double vx/vy/wz, odom_x/y/yaw, gyro_yaw/wz, wheel_rpm[4];
-                        uint16_t status, cmd_cnt, fb_seq; bool valid; double age_s; };
-```
+**坐标约定（必须先记牢，与底盘库一致）**：`vx` = 车体前进、`vy` = 车体左移、`wz` = 俯视逆时针。
+旧草案的「vx 右 / vy 前」已废弃，代码里只有这一套。
 
-🚗 **坐标约定**：`vx` 前进、`vy` 左移、`wz` 逆时针（与底盘库一致，旧「右/前」草案已废弃）。
+### 8.1 USART2 串口协议（`UnifiedSerial` 的底盘部分）
 
-**UART 后端（`UnifiedSerial`，默认）**：云台 ZDT 帧与底盘 F407 帧共用一个 CH340 串口，
-RX 按帧边界分流（`5A A5 81`+40B+CRC+`0D` → 底盘；`Addr∈1..32`+func+…+`6B` → ZDT），
-底盘命令 5 ms 节流、反馈超时 0.3 s 置 `valid=false`。用于没有第二路串口、或不需要 CAN 的场合。
+**命令帧（Jetson → F407，12 B，小端）**
 
-**CAN 后端（`CanChassisLink`，SocketCAN 标准帧）**：
+| off | 0 | 1 | 2 | 3 | 4..5 | 6..7 | 8..9 | 10 | 11 |
+|---|---|---|---|---|---|---|---|---|---|
+| 字段 | `0xA5` | `0x5A` | cmd | seq | vx | vy | wz | flags | crc8 |
+| 类型 | u8 | u8 | u8 | u8 | i16 | i16 | i16 | u8 | u8 |
 
-```
-0x000  广播急停（DLC 任意；Jetson 发、F407 只收）——最高优先级
-0x020  速度命令 100 Hz：cmd seq vx(i16) vy(i16) wz(i16 0.01rad/s)
-0x021  标志帧 10 Hz 保活 + flags 变化时立即发：flags(bit0 EN)
-0x110~0x114  反馈 40 B 按 8 字节切 5 帧，100 Hz；组超时 5 ms、CRC 失败整组丢弃
-```
+- `vx/vy` 单位 **mm/s**，`wz` 单位 **0.01 rad/s**
+- `crc8` = CRC-8/ATM（poly `0x07`，init `0`），覆盖第 0~10 字节
+- 命令字：`0x01` 速度 / `0x02` 急停 / `0x03` 小陀螺 / `0x04` 清零
+- flags：`0x01` = EN（允许驱动）
 
-命令帧/反馈帧字段与 UART 版完全一致（只是搬运方式不同）。打开逻辑：
-`--device` 或 `--chassis` 选 `can0` 即走 SocketCAN；`CanFbGroup` 组拼装见 §4.7。
+**反馈帧（F407 → Jetson，40 B，小端，100 Hz）**
 
-**后端组合与仲裁**：
+| off | 字段 | 类型 | 单位 |
+|---|---|---|---|
+| 0..1 | `0x5A 0xA5` | — | 帧头 |
+| 2 | 类型 `0x81` | u8 | — |
+| 3 | seq（回显最后一条合法命令） | u8 | — |
+| 4..7 / 8..11 | x / y（里程计） | i32 | mm |
+| 12..13 | yaw（里程计） | i16 | 0.01° |
+| 14..15 / 16..17 / 18..19 | 正解 vx / vy / wz | i16 | mm/s / 0.01 rad/s |
+| 20..21 / 22..23 | gyro_yaw（陀螺积分）/ gyro_wz（陀螺实测） | i16 | 0.01° / 0.01 rad/s |
+| 24..25 | status（位见下） | u16 | — |
+| 26..27 / 28..29 | cmd_cnt（累计合法命令数）/ fb_seq（反馈帧序号） | u16 | — |
+| 30..37 | 四轮实测转速 FL / FR / BL / BR | i16×4 | 0.01 RPM |
+| 38 / 39 | crc8（覆盖 0~37）/ 帧尾 `0x0D` | u8 | — |
 
-| 想怎么接 | 参数 | 总线 |
+> **v2 变更**：30~37 新增四轮实测转速（0.01 RPM），麦轮方向检查靠它。
+
+**status 状态位**
+
+| 位 | 名称 | 含义 |
 |---|---|---|
-| 全串口 | 默认（`--device /dev/ttyUSB0`） | 云台 ZDT + 底盘共用 1 个 CH340 |
-| 混合 | `--chassis can0` | 云台 UART + 底盘 CAN |
-| 全 CAN | `--device can0` | 云台 ZDT 扩展帧 + 底盘标准帧共用 `can0` |
-| yaw CAN | `--yaw-can can0` | yaw 走 CAN，pitch + 底盘走串口 |
-| 只控云台 | `--no-chassis` | 关底盘链路 |
+| `0x0001` | IMU_ONLINE | IMU 在线 |
+| `0x0002` | LINK_OK | 500 ms 内收到过控制帧 |
+| `0x0004` | WATCHDOG | 100 ms 无控制帧（已自动停车） |
+| `0x0008` | ESTOP | 急停锁存中 |
+| `0x0010` | DRIVER_ON | TB6612 STBY 高（输出使能） |
+| `0x0020` | SPIN | 小陀螺模式 |
+| `0x0040` | GYRO_ON | 陀螺外环非 OFF |
+| `0x0080` | IMU_CAL | 零偏标定有效 |
+| `0x0100` | CAN_ERR | CAN error-passive 预警（TEC/REC > 96，**仅 CAN 链路会出现**；Jetson 侧 `chassis_status::CanErr` 同名解码） |
 
-- 命令字：`01` 速度 / `02` 急停 / `03` 小陀螺 / `04` 清零；flags `0x01` = EN
-- 看门狗：Jetson 250 ms 无 UDP → 发 EN=0；F407 100 ms 无帧 → 斜坡停车（**不失能**）
-- 完整字段表、状态位、排障方法见 [`CHASSIS_LINK.md`](CHASSIS_LINK.md)
+**安全语义（三层）**：①Jetson 侧 UDP 指令断流 250 ms → 主动发 EN=0 停车帧；
+②F407 侧控制帧 100 ms 未到 → 目标速度清零走斜坡减速，**但 STBY 保持高**（不松轴）；
+③只有 `x` / `cx` 才拉低 STBY（电机自由）。
 
-⚠️ 云台 ZDT 切 CAN 模式后（面板/上位机切 + 1 Mbps），与底盘标准帧同总线混跑，
-两者 ID 类型不同（11-bit vs 29-bit 扩展帧）天然隔离，不冲突。
+### 8.2 CAN 底盘链路（`can0`，11-bit 标准帧，1 Mbps）
+
+`CanChassisLink`（`src/link/can_chassis_link.cpp`）用 SocketCAN 实现同一套协议：
+
+| ID | 方向 | 内容 | 备注 |
+|---|---|---|---|
+| `0x000` | Jetson → F407 | 广播急停 | DLC 任意（含 0）；**Jetson 发、F407 只收不发**；ID 最小 = 仲裁最高优先级 |
+| `0x020` | Jetson → F407 | `[cmd, seq, vx(i16), vy(i16), wz(i16)]`，100 Hz | 与串口命令帧字段语义一致（flags 取自 `0x021`） |
+| `0x021` | Jetson → F407 | `[flags]`（bit0 = EN），10 Hz 保活 + 变化即发 | 只是标志帧，**不计入 `cmd_cnt`**、不喂看门狗 |
+| `0x110~0x114` | F407 → Jetson | 40 B 反馈按 8 字节切 5 帧（字段同 §8.1），100 Hz | 接收端按组规则拼装 |
+
+**组完整性规则**（`CanFbGroup`）：`0x110` 开新组 → `0x111~0x114` 按序填入 → 下一个 `0x110`
+冲掉未满旧组 → 组超时 **5 ms** 丢弃 → `crc8` 失败整组丢弃（绝不输出半帧）。
+
+**Jetson 侧参数**：命令 10 ms、flags 10 Hz、组超时 5 ms、反馈超时 100 ms（`state().valid=0`）、
+socket 重开 1 s。起 `can0` 与验证：
+
+```bash
+sudo slcand -o -s8 -t hw /dev/ttyACM1 can0 && sudo ip link set can0 up   # 编号以 ls /dev/ttyACM* 为准
+candump -td can0      # 应看到 0x110~0x114 每 10 ms 一组、组内连续
+cansend can0 021#01   # EN 开；随后 020 速度才生效
+cansend can0 000#     # 广播急停（DLC=0 也认）
+```
+
+**UART 与 CAN 的取舍**：只有一块 CH340 时用 UART（`UnifiedSerial`，底盘 + 云台共线）；
+需要更短总线、多设备（ZDT 云台也上 CAN）时用 CAN（`--chassis can0` 或全 CAN `--device can0`）。
+两者命令/反馈字段完全一致，上层 `IChassisLink` 不用改。协议细节见底盘仓库
+`docs/README.md` **§15**（原 `CAN_CONTROL_PROTOCOL.md`，已合并）与 `UserLib/Comm/README.md`。
+
+### 8.3 UDP 线协议（`gimbal_ctl` ↔ `gimbal`）
+
+**所有字段小端，用显式字节偏移写编解码，不依赖结构体 padding** —— 两端必须逐字节一致。
+
+**上行 24 B**：magic `0x4D454341` / seq / yaw_cdps / pitch_cdps / flags / chk（0~12 XOR）/
+vx_mmps / vy_mmps / wz_mradps / chassis_flags / chk2（14~20 XOR）/ pad
+
+**下行 64 B**：云台遥测（前 32 B）+ 底盘遥测（32~53：位姿 / 正解 / 陀螺 / status / valid）
++ 四轮转速（54~61，0.01 RPM）+ chk16b（62~63）
+
+`flags`（上行）：`0x01` Enable · `0x02` Hold · `0x04` Home · `0x08` Zero · `0x10` EStop ·
+`0x20` ClearStall · `0x40` Disable · `0x80` Fire（水弹扳机）。
+`chassis_flags`：`0x01` EN / `0x02` EStop / `0x04` Clear。
+
+> v1（上行 16 B / 下行 32 B）旧帧仍可解码，v1 的 16 字节前缀在 v2 里不变。
+
+**为什么用 UDP**：控制包极小；**无队头阻塞**（丢包直接丢，等重传反而更糟）；
+**无连接状态**（客户端崩溃 / 重连不需握手）。丢包容忍与时效判断交给两端看门狗。
 
 ---
 
-## 8. 下一步
+## 9. 水弹波箱火力（可选）
 
-- [x] **PC 端控制客户端**：原生 X11 客户端 `../gimbal_ctl`（已完成；云台改方向键 + 底盘 WASD）
-- [x] **底盘链路 v2**：命令 12 B / 反馈 40 B 含四轮转速，UART 真机验证 × UDP→Jetson→F407 全栈跑通
-- [x] **CAN 底盘链路**：`CanChassisLink`（SocketCAN）+ `CanFbGroup` 组拼装，自检 [8] 全绿、实测 100 Hz 反馈
-- [ ] **云台联调**：接上第二个 CH340 + 两个 ZDT（确认方向极性、pitch 软限位范围）或切 CAN 模式
-- [ ] **云台 ZDT 切 CAN 模式 + 1 Mbps**：面板/上位机切换，切换后 `candump can0` 看到扩展帧应答
-- [ ] **`--device can0` 全 CAN 端到端联调**：底盘标准帧 + ZDT 扩展帧同总线混跑
-- [ ] 双轴同步运动（多机同步标志 / 多电机命令）
-- [ ] 位置模式（绝对角度指向）
+gimbal 不直接驱动 MOS，而是 fork 一个 Python worker，用 `Jetson.GPIO` 的 BOARD 模式管子：
 
----
+```
+gimbal_ctl 按住 F ──UDP Fire 位(0x80)──► gimbal ──管道 "1\n"/"0\n"──► fire_worker.py ──BOARD 12──► MOS
+```
 
-## 9. 已知限制
-
-1. **角度估计会漂移**：`0x36` 对 Emm 固件是单圈值，取不到多圈绝对值，
-   所以 `estAngleDeg()` 是靠转速积分出来的软件估计。
-   真正的绝对保护应依赖驱动板的限位开关输入（状态位 bit4/bit5）。
-2. **ZDT CAN 传输层未上机验证**：`can_transport.cpp` 帧封装/拆包/重组按手册写好了，
-   但云台 ZDT 尚未切 CAN 模式，联调前请先 `candump can0` 抓包核对。
-3. **X 固件的位置模式未实现**：`mkPositionEmm()` 只覆盖 Emm；用 X 固件需按
-   手册 §5.3.10 补一个帧构造器。
-4. **图传不做转码**：`mjpeg_server` 直接把摄像头输出的 MJPG 原样转发，
-   不支持 YUYV-only 的摄像头；低光下自动曝光会拉长到 1/15 s，帧率掉到 ~16-20 fps。
-5. **`can0` 编号随插拔变化**：`/dev/ttyACM*` 以实际枚举为准，`CanChassisLink` 打开失败时
-   会按 `reconnect_s`（1 s）重试，但接口名写死 `can0` 时需要人工确认。
+- 触发条件：UDP 扳机位**最后一帧 0.3 s 内有效**，或本地 stdin `f 1|0`；
+- 节拍：高 **80 ms** / 低 **120 ms**（环境变量 `FIRE_GRIP_MS` / `FIRE_GAP_MS` 可调），`FIRE_VERBOSE=1` 打时间戳；
+- 停火：松键 / 0.3 s 超时 / 急停清本地请求 / 父进程退出（stdin EOF → worker 自杀）/ 析构写 `0\nq\n`；
+- ⚠️ **没有连续导通 5 s 上限**（那是 F401 固件方案的保护，见 `fire/README.md`）。
 
 ---
 
-## 10. 详细文档索引
+## 10. 操作手册
 
-| 想看什么 | 去哪 |
+### 10.1 Jetson 端命令行参数（默认值即当前实机配置）
+
+| 参数 | 默认 | 说明 | 参数 | 默认 | 说明 |
+|---|---|---|---|---|---|
+| `--device` | `/dev/ttyUSB0` | 串口设备（或 `can0`） | `--acc` | 200 | 加速度档位 0–255 |
+| `--baud` | 115200 | 波特率 | `--ctrl-port` | 40001 | UDP 控制口 |
+| `--yaw-addr` | **1** | yaw 电机地址 | `--no-udp` | off | 不开 UDP，只用 stdin |
+| `--pitch-addr` | **2** | pitch 电机地址 | `--hz` | 100 | 控制频率 |
+| `--gear` | **2.0** | yaw 传动比 | `--can <iface>` | — | 两轴都走 SocketCAN |
+| `--pitch-gear` | **1.0** | pitch 传动比（直连） | `--yaw-can <iface>` | — | 仅 yaw 走 CAN |
+| `--pulses` | 3200 | 脉冲 / 电机圈 | `--chassis <serial\|canX>` | serial | 底盘后端 |
+| `--yaw-limit a b` | 关闭 | 给 yaw 启软限位 | `--no-chassis` | off | 不接底盘 |
+| `--pitch-limit a b` | **−30 30** | pitch 软限位 | `--fire-script` | `src/device/fire_worker.py` | 火力 worker 路径 |
+| `--yaw-rate` | 180 | yaw 最大 °/s | `--fire-pin` | 12 | 火力 GPIO（BOARD 号） |
+| `--pitch-rate` | 120 | pitch 最大 °/s | `--no-fire` | off | 不启动火力进程 |
+| `--selftest` | off | 自检后退出 | `-h` / `--help` | — | 打印用法 |
+
+**本地 stdin 命令**（一行一条）：
+
+| 命令 | 作用 |
 |---|---|
-| 头文件层（接口 / 线协议 / 分层） | [`include/gimbal/README.md`](include/gimbal/README.md) |
-| 源码层（main.cpp 流程 / 各 cpp） | [`src/README.md`](src/README.md) |
-| 底盘链路使用与排障（UART + CAN、图传、无线） | [`CHASSIS_LINK.md`](CHASSIS_LINK.md) |
-| 2026-10-19 联调记录（单串口合并 / 无线 / IMU） | [`DEBUG_REPORT_2026-10-19.md`](DEBUG_REPORT_2026-10-19.md) |
-| F407 固件与协议 | `~/stmproject/INTRA_SCHOOL_COMPETITION_27RM`（`UserLib/Comm/README.md`、`docs/CAN_CONTROL_PROTOCOL.md`） |
-| PC 客户端 | `~/gimbal_ctl` |
+| `y <dps>` / `p <dps>` / `r <y> <p>` | 设 yaw / pitch / 两轴角速度（°/s） |
+| `h` / `hold` | 停手（**保持使能**，抱死） |
+| `home` / `zero` | 回中 / 把当前位置当作 0°（应在机械零点执行） |
+| `en 0\|1` | 使能 / 失能 |
+| `x` / `estop` | 急停（立即停止 + 失能） |
+| `s` | 打印状态 |
+| `q` | 退出 |
+| `f 1\|0` | 开火 / 停火（调试用） |
+| `c <vx> <vy> <wz>` / `cx` | 底盘速度指令（mm/s, mm/s, mrad/s）/ 底盘急停 |
 
-### 修订记录
+### 10.2 笔记本客户端 `gimbal_ctl`
+
+```bash
+cd ~/gimbal_ctl && cmake -S . -B build && cmake --build build -j4
+./build/gimbal_ctl --host 10.42.0.1        # 无线（Jetson AP）
+./build/gimbal_ctl --host 192.168.2.2      # 有线
+./build/gimbal_ctl --host 192.168.2.2 --no-video
+```
+
+| 键 | 作用 |
+|---|---|
+| `←/→` | 云台 yaw 左 / 右（按住转，松开停，`--gimbal-rate` 默认 120 °/s） |
+| `↑/↓` | 云台 pitch 抬头 / 低头 |
+| `W/S` `A/D` `Q/E` | 底盘前进/后退、左移/右移、左转/右转 |
+| **空格** | 停手 / 继续（HOLD 开关，云台 + 底盘 + 发射一起停） |
+| `g` | 云台使能 / 失能切换 |
+| `j` | 底盘使能 / 失能切换（**底盘急停后按 `j` 恢复**） |
+| `x` | 急停（云台 EStop + 底盘 STBY 拉低） |
+| **`F`（按住）** | **水弹发射**（按住连发，松开停） |
+| `c` | 底盘里程计清零 |
+| `h` / `z` / `r` | 云台回中 / 当前位置归零 / 清空当前速率 |
+| `v` | 视频开关 |
+| `Esc` | 退出（退出前自动发一帧停手指令） |
+
+> 云台改方向键控制后，**鼠标不再参与控制**（`--mode` / `--sens` / `--invert-y` 保留但已不生效）。
+> 窗口文字是纯 ASCII（X11 核心字体只有 ASCII，写中文必乱码）。
+
+### 10.3 图传（车载摄像头 → 笔记本）
+
+Jetson 上用 `mjpeg_server`（C++17，V4L2 直出 MJPG，零转码）：
+
+```bash
+cd ~/gimbal
+./build/mjpeg_server --size 640x480 --fps 30 --port 8080     # 默认就是这个
+# 浏览器验证：http://<Jetson_IP>:8080/stream
+```
+
+`gimbal_ctl` 启动时自动拉 `http://<host>:8080/stream` 画在窗口里（`v` 键开关）。
+带宽参考：640x480@30 实测约 **2 Mbps**；1280x720@30 约 8~15 Mbps。
+
+### 10.4 无线连接（笔记本 ↔ Jetson AP）
+
+**Jetson 侧起 AP**（`car-ap` 是 `autoconnect=no`，需手动拉起）：
+
+```bash
+sudo nmcli con up car-ap
+cat /proc/net/dev | grep wlan0; sleep 3; cat /proc/net/dev | grep wlan0   # tx 字节要在涨（见 §11.6）
+```
+
+AP 参数：SSID `MECAR-CTRL` / 密码 `mecar12345` / 2.4 GHz ch6 / `10.42.0.1/24` / mDNS `nano.local`
+
+**笔记本接入**：
+
+```bash
+# ① 连 AP（会切走校园网，暂时没外网，正常）
+sudo nmcli device wifi connect MECAR-CTRL password mecar12345
+ip -br addr show wlp14s0          # 应拿到 10.42.0.x
+
+# ② 绕过 Meta(Clash) VPN：否则 10.42.0.1 会被塞进隧道
+sudo ip rule add to 10.42.0.0/24 lookup main priority 8000
+
+# ③ 验证：必须是 dev wlp14s0，不能是 dev Meta
+ip route get 10.42.0.1
+ping -c3 10.42.0.1
+```
+
+**笔记本 Wi-Fi 省电必须关**（否则 ping 的 RTT 会到 333~488 ms、抖动很大，控车是 100 Hz UDP 扛不住）：
+
+```bash
+nmcli con mod <MECAR-CTRL 配置名> 802-11-wireless.powersave 2   # 2 = disable
+iw dev wlp14s0 get power_save                                   # 重连后应显示 off
+```
+
+> ⚠️ 这个 NetworkManager 版本取值是 `0=default`、`1=ignore`、`2=disable`、`3=enable`——
+> 设成 `0`（default）**不会**关掉省电，之前踩过（`iw` 一直显示 on）。
+
+**切回校园网 / 恢复上网**：
+
+```bash
+sudo ip rule del to 10.42.0.0/24 lookup main priority 8000   # 删临时绕行规则
+sudo nmcli con up 黑大联通                                    # 或你平时连的 WiFi 名
+ip -br addr show wlp14s0                                     # 应回到 10.230.x 之类
+ping -c3 8.8.8.8                                             # 验证外网
+sudo nmcli con down car-ap                                   # 可选：关 AP 省电（在 Jetson 上）
+```
+
+> `ip rule` 是**临时**的，每次重连 WiFi / 重启 VPN 后都要重新加。
+> 开 AP 时 Jetson 自己连不了别的 Wi-Fi（网卡只能干一件事），有线调试链路不受影响。
+
+---
+
+## 11. 排障
+
+### 11.1 串口被占用 / 串口怎么区分
+
+`/dev/ttyUSB*` 同一时刻只能被一个进程打开，`gimbal` 在跑时再跑测试脚本会打不开：
+
+```bash
+fuser -v /dev/ttyUSB0     # 看谁占着
+pkill -x gimbal           # 停掉（别用 pkill -f build/gimbal，远程 shell 里会误杀自己的 shell）
+```
+
+| 场景 | 设备 |
+|---|---|
+| F407 USART2（控制链路）+ 云台 ZDT（共用一个 CH340） | `/dev/ttyUSB0` |
+| F407 USART1（调试打印） | `/dev/ttyACM0`（DAP-LINK 虚拟串口，笔记本上） |
+| 底盘 CAN / 云台 CAN | `can0`（CANable 2.0；编号随插拔变化，以 `ls /dev/ttyACM*` 为准） |
+
+> 2026-10-19 起底盘与云台合并到同一个 CH340（`UnifiedSerial`），不再需要第二路串口；
+> 需要时也可 `--yaw-can can0` 把 yaw 单独放 CAN。
+
+### 11.2 反馈帧全部解析失败 / 一帧都解不出来
+
+先确认 **F407 固件版本**与 Jetson 侧一致：
+
+| 版本 | 反馈帧长 | 特征 |
+|---|---|---|
+| v1（旧） | 32 B | 无四轮转速 |
+| **v2（当前）** | **40 B** | 30~37 是四轮转速 |
+
+帧长不匹配时表现为「CRC 错 / 同步错狂涨、一帧都解不出来」。重新烧录固件即可。
+
+### 11.3 用 openocd/SWD 调试后电机还在转
+
+`openocd ... -c "halt"` 会把 CPU 停住，但 **PWM 由定时器硬件输出，CPU 停了照样转**，而且此时看门狗也不工作。
+调试完必须恢复运行：
+
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/stm32f4x.cfg \
+  -c "adapter speed 500" -c "init" -c "reset run" -c "shutdown"
+```
+
+或直接按板子上的 RESET。**别让板子停在 halt 状态去碰车。**
+
+### 11.4 没给指令，轮子却按「自旋模式」转（陀螺外环积分残留）
+
+**现象**：发送的 vx/vy/wz 全是 0，但轮速呈现 `FL −, FR −, BL +, BR +`（纯自旋），正解 wz ≈ 0.1 rad/s，
+而**陀螺 wz ≈ 0**（车没转），架空时尤其明显。
+
+**根因**：陀螺外环（`chassis_gyro.c`）的积分项被上一次自旋/打滑充满后没人清零——架空时轮子转、车体不转，
+陀螺测不到转动 → 误差恒为 0 → 积分永远不泄 → 死锁。
+
+**修复（F407 侧，2026-10-18）**：①`|wz_ref| < 0.02 且 |陀螺 wz| < 0.1` 时积分项按 τ=0.3 s 衰减到 0；
+②新增 `chassis_gyro_reset_correction()`，`uart_link` 在停车/急停/看门狗时调用（只清修正量、不动 yaw）。
+
+### 11.5 反馈帧率不是整 100 Hz
+
+`chassis_debug` 每 250 ms 往 USART1 阻塞发一行（约 8.7 ms），会把个别 10 ms 节拍推后，
+表现为 ~96 Hz、偶发 20.9 ms 间隔。**不丢帧、不影响控制**；想治就把它改成 IT 发送（最新固件已改）。
+
+### 11.6 车载 AP「假活」：状态 activated 但不发信标
+
+**现象**：`nmcli` 显示 `car-ap:activated`、`iw dev wlan0 info` 看着正常，但笔记本扫不到 SSID。
+
+```bash
+cat /proc/net/dev | grep wlan0; sleep 3; cat /proc/net/dev | grep wlan0
+# tx 字节不增长 => 真的没在发
+sudo nmcli con down car-ap && sudo nmcli con up car-ap    # 修复（Intel 8265 的 AP 模式偶发失效）
+```
+
+### 11.7 笔记本连上 AP 但 ping 不通 10.42.0.1
+
+多半是 Meta(Clash) VPN 抢了路由：
+
+```bash
+ip route get 10.42.0.1     # 看到 dev Meta 就不对
+sudo ip rule add to 10.42.0.0/24 lookup main priority 8000
+```
+
+### 11.8 无线控车延迟大 / 抖动
+
+1. 先按 §10.4 确认笔记本 Wi-Fi 省电已关（`iw dev wlp14s0 get power_save` 应为 `off`）；
+2. 客户端 `--tau` 默认 30 ms，想更跟手可试 `0.02`，抖了就回 `0.03~0.04`；
+3. 有线调试用 `--host 192.168.2.2` 对比，排除是 WiFi 还是链路本身的问题。
+
+### 11.9 台架测试工具（不是产品代码）
+
+`~/stmproject/INTRA_SCHOOL_COMPETITION_27RM/tools/uart_link_test.py`（拷到 Jetson 上一般放 `/tmp/`）：
+
+```bash
+pkill -x gimbal                                                     # 串口只能一个进程占用
+python3 -u /tmp/uart_link_test.py check -p /dev/ttyUSB0             # 全链路体检（约 10 s）
+python3 -u /tmp/uart_link_test.py check --move 100 -p /dev/ttyUSB0  # 三轴方向（需架空）
+python3 -u /tmp/uart_link_test.py soak --secs 30 -p /dev/ttyUSB0    # 长时间稳定性
+python3 -u /tmp/uart_link_test.py wheels -p /dev/ttyUSB0            # 四轮方向（需架空）
+```
+
+> `-u` 必须带（否则输出被缓冲，看起来像卡死）。
+
+**验证链路健康的三个数**：①Jetson `s` 里 yaw/pitch 的 frames 在涨（云台在回帧）；
+②底盘 `valid=1`、`cmd_cnt` 在涨（命令到了 F407）；③客户端 `link ... rx=100`、`chassis ONLINE`。
+
+---
+
+## 12. 实测数据
+
+### 12.1 2026-10-18 真机（UART 链路）
+
+| 项 | 结果 |
+|---|---|
+| 反馈帧率 | 96.0 Hz（受 §11.5 影响） |
+| 命令接收 | 99.8 Hz |
+| 反馈丢帧 | 0（20 s soak，`fb_seq` 连续） |
+| CRC 错 / 同步错 | 0 / 1（开播半帧） |
+| 最大接收间隔 | 20.9 ms |
+| 三轴方向 | vx/vy/wz 符号全部一致 |
+| 急停 | ESTOP 位亮、DRIVER_ON 清除、恢复后正常 |
+| 断流 1.2 s | WATCHDOG 亮、LINK_OK 灭、速度归零、STBY 保持 |
+| 全栈 | 笔记本 UDP(vx=80 mm/s) → Jetson → F407 → 正解 71 mm/s |
+| F407 阶跃响应 | 0→300 mm/s：**t50 = 34 ms，t90 = 64 ms**（轮速斜坡 1500 RPM/s + PID） |
+| 图传 | 640x480@30，实测 ~21 fps / ~2 Mbps，HTTP multipart 正常 |
+
+**延迟分解（"慢半拍"从哪来）**
+
+| 环节 | 延迟 | 说明 |
+|---|---|---|
+| F407 轮速斜坡 + PID | ~64 ms (t90) | 1500 RPM/s 斜坡，防打滑，不建议再快 |
+| Jetson 底盘指令周期 | 5 ms | `unified_serial.hpp` 的 `chassis_tx_period_s`（已从 10 ms 降到 5 ms） |
+| Jetson 控制循环 | 10 ms | 100 Hz |
+| UDP / 网络 | 0.4 ms（有线）/ 几 ms（WiFi） | |
+| **客户端平滑 tau** | **30 ms**（默认，原 50 ms） | `--tau` 可调，越小越跟手、越易抖 |
+| 遥测显示 | 20 ms | 50 Hz（原 20 Hz） |
+
+### 12.2 CAN 链路实测（2026-10-21，CANable 2.0 ↔ F407 `can_link`）
+
+| 项 | 结果 |
+|---|---|
+| 建立 | `sudo slcand -o -s8 -t hw /dev/ttyACM1 can0 && sudo ip link set can0 up` → `can0 UP` |
+| 反馈组 | `0x110~0x114` 每 ~9.2 ms 一组（≈100 Hz），组内延迟 ~100 µs（远小于 2 ms 承诺） |
+| 反馈解码 | 拼回 40 B，`valid=1`，status = `0x00D3`（IMU 在线 + 标定 + 驱动使能 + LINK_OK） |
+| 组规则 | `CanFbGroup` 自检 [8] 全绿（顺序/乱序/缺帧/CRC 坏组/非反馈帧） |
+| 云台 ZDT | 扩展帧在发（`0x000100/0x000200 35/36 6B` 遥测轮询），但电机仍 UART 模式 → 无应答（待切 CAN 模式 + 1 Mbps） |
+
+### 12.3 2026-10-19 联调（单串口合并 + 无线 + F407 IMU 修复）
+
+**一句话**：把底盘（F407 帧）和云台（ZDT 帧）合到同一个 CH340；Jetson 开 Wi-Fi 热点让笔记本无线控制；
+客户端窗口英文化解决乱码；并配合修掉 F407 侧 IMU I2C 地址应答不稳导致的「电机一卡一卡」。
+最终 F407 反馈回到 **100 Hz**、IMU `e=0 / CAL=1`、无线 UDP 链路通。
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| F407 反馈帧率 | 57 Hz（p50 10.1 ms / p90 51.7 ms / max 67.7 ms） | **100 Hz**（2 s 200 帧，200/201 CRC 全对） |
+| IMU 错误计数 `e=` | 149 万，持续 +280~520/s | **0** |
+| 单次 I2C 读耗时 `us=` | 27 µs（地址 NACK） | 214 µs（正常） |
+| 零偏标定 `CAL` | 0（无效） | **1** |
+| 采样节拍 `hz=` | 499 | 499 |
+| 无线 | — | 笔记本 10.42.0.169 ↔ Jetson 10.42.0.1，ping 通 |
+| 共享总线 | — | 跑 gimbal 时 ZDT 应答偶与 F407 反馈抢线，客户端底盘偶发 `OFFLINE`（不影响控制） |
+
+F407 侧根因与修法（完整证据链见底盘仓库 `docs/README.md` §17.7）：
+IMU 约一半的读在**地址字节**就被 NACK（`us≈27 µs`，不是 3 ms 超时），推断 SA0 在 0x6A/0x6B 间漂移
+→ 连续失败触发**阻塞式总线恢复**（每次 ~25 ms，每 100 ms 一次）+ 部分读走满 3 ms 超时
+→ 1 kHz 控制环掉拍 30~40%。修：①读失败换地址重试并锁定（`e` 150 万 → 0）；②`hw_bus_unstick()` 的
+`HAL_Delay(1)` 改 10 µs DWT 忙等（25 ms → 0.24 ms）；③调试串口改 `Transmit_IT` + 补 USART1 NVIC/IRQHandler；
+④`uart_link.c` 的 TxCplt 回调转发清忙标志。
+
+---
+
+## 13. 代码位置
+
+| 内容 | 路径 |
+|---|---|
+| 底盘链路协议（Jetson） | `include/gimbal/link/chassis_link.hpp` |
+| 单串口统一链路（UART 底盘 + ZDT 共线） | `include/gimbal/link/unified_serial.hpp` / `src/link/unified_serial.cpp` |
+| CAN 底盘链路（SocketCAN） | `include/gimbal/link/can_chassis_link.hpp` / `src/link/can_chassis_link.cpp` |
+| UDP 协议 v2 | `include/gimbal/link/control_link.hpp` / `src/link/udp_control_link.cpp` |
+| 主程序 / 底盘仲裁 / 火力接线 | `src/main.cpp` |
+| 水弹波箱 | `include/gimbal/device/fire_control.hpp` / `src/device/fire_control.cpp` / `src/device/fire_worker.py` |
+| 图传 | `src/video/mjpeg_server.cpp` |
+| 笔记本客户端 | `~/gimbal_ctl/src/main.cpp`（协议头直接复用 `../gimbal/include/...`，不复制） |
+| F407 串口链路实现 | `~/stmproject/INTRA_SCHOOL_COMPETITION_27RM/UserLib/Comm/uart_link.{c,h,codec.h}` |
+| F407 CAN 链路实现 | 同目录 `can_link.{c,h}` + `can_link_config.h`（协议与串口版一致） |
+| F407 协议常量 | 同目录 `uart_link_config.h` |
+| F407 台架工具 | 同仓库 `tools/uart_link_test.py`、`tools/codec_test.c` |
+| F407 文档（帧表/组规则/联调/IMU） | 同仓库 `docs/README.md`（§15 CAN、§17 IMU、§18 uart_link） |
+
+---
+
+## 14. 已知限制与待办
+
+**限制**
+
+1. **角度估计会漂移**：`0x36` 对 Emm 固件是单圈值，取不到多圈绝对值，`estAngleDeg()` 是靠转速积分出的软件估计。
+   真正的绝对保护应依赖驱动板的限位开关输入（状态位 `bit4/bit5`）。
+2. **ZDT CAN 传输层未上机验证**：`can_transport.cpp` 帧封装/拆包/重组按手册写好了，但云台 ZDT 尚未切 CAN 模式，
+   联调前请先 `candump can0` 抓包核对。
+3. **X 固件的位置模式未实现**：`mkPositionEmm()` 只覆盖 Emm；用 X 固件需按手册 §5.3.10 补一个帧构造器。
+4. **图传不做转码**：`mjpeg_server` 直接把摄像头输出的 MJPG 原样转发，不支持 YUYV-only 的摄像头；
+   低光下自动曝光会拉长到 1/15 s，帧率掉到 ~16-20 fps。
+5. **`can0` 编号随插拔变化**：`/dev/ttyACM*` 以实际枚举为准；`CanChassisLink` 打开失败时按 1 s 重试，
+   但接口名写死 `can0` 时需人工确认。
+6. **三机 TX 并线抢线**：见 §5.7（物理根治需 485）。
+
+**待办**
+
+| # | 事项 | 说明 |
+|---|---|---|
+| 1 | 云台联调 | 接两个 ZDT（确认方向极性、pitch 软限位范围）或切 CAN 模式 |
+| 2 | 云台 ZDT 切 CAN 模式 + 1 Mbps | 面板/上位机切换后 `candump can0` 应看到扩展帧应答 |
+| 3 | `--device can0` 全 CAN 端到端联调 | 底盘标准帧 + ZDT 扩展帧同总线混跑 |
+| 4 | 双轴同步运动 | 多机同步标志 / 多电机命令（手册 §3.5.2） |
+| 5 | 位置模式 | 绝对角度指向；`mkPositionEmm()` 已实现，待上机验证 |
+| 6 | **AP 开机自启** | `car-ap` 的 `connection.autoconnect=false`，重启后热点不会自己起来：`sudo nmcli con mod car-ap connection.autoconnect yes` |
+| 7 | 共享总线抢线 | ZDT 遥测轮询 100 ms 周期偏密，可放宽到 250 ms 减少与 F407 反馈碰撞 |
+| 8 | F407 IMU 硬件 SA0 | 软件已用「换地址重试」兜住，但根因（SA0 悬空/接触不良）待查 |
+
+---
+
+## 15. 修订记录
 
 | 日期 | 说明 |
 |---|---|
 | 2026-10-18 | 重写上位机工程文档：五层架构、ZDT Emm5.0 协议要点、UDP v1 协议、底盘 UART 链路 v2 |
-| 2026-10-19 | 单串口统一链路（`UnifiedSerial` 合并底盘 + 云台）、无线 AP、客户端英文化、UDP 协议升 v2（24 B/64 B 含底盘字段） |
-| 2026-10-21 | 新增 CAN 底盘链路（`CanChassisLink` + `CanFbGroup`）、`--yaw-can` / `--no-udp` 参数、自检补 [8][9]；文档同步到当前代码（行数、目录树、双后端组合） |
+| 2026-10-19 | 单串口统一链路（`UnifiedSerial` 合并底盘 + 云台）、无线 AP、客户端英文化、UDP 协议升 v2（24 B/64 B 含底盘字段）、IMU「一卡一卡」修复（§12.3） |
+| 2026-10-21 | 新增 CAN 底盘链路（`CanChassisLink` + `CanFbGroup`）、`--yaw-can` / `--no-udp` 参数、自检补 [8][9]；文档同步到当前代码 |
+| 2026-11-05 | **三份文档合并为本 README**（原 `CHASSIS_LINK.md` / `DEBUG_REPORT_2026-10-19.md` 已并入并删除）；顺带修正过期内容：`--dry` / `--chassis-dev` / `--chassis-baud` 等已移除参数、电机地址 yaw=1/pitch=2、pitch 直连 1:1 与 ±30° 限位、客户端按键 `g`/`j`/`F`、补水弹波箱与环境 GPIO 火力说明、补 `fire_control` 相关文件到目录树 |

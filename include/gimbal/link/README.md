@@ -218,7 +218,7 @@ struct Config {
 - **CAN**：`link/can_chassis_link.hpp` 的 `CanChassisLink`（SocketCAN 标准帧）：
   `0x020` 100 Hz 命令、`0x021` 10 Hz 保活、`0x000` 广播急停、`0x110~0x114` 反馈五帧；
   `CanFbGroup` 负责组拼装（组超时 5 ms、CRC 失败整组丢弃）。
-  帧表与组规则见底盘仓库 `docs/CAN_CONTROL_PROTOCOL.md`。
+  帧表与组规则见底盘仓库 `docs/README.md` §15。
 
 ## 4. 链路状态位对照（Jetson ↔ F407）
 

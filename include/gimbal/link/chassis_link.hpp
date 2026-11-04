@@ -6,7 +6,7 @@
 //    反馈帧（F407 -> Jetson）40 B（v2：末尾含四轮实测转速）
 //    CRC-8/ATM(poly=0x07, init=0x00)，100 Hz 双向
 //
-//  ⚠️ 坐标约定跟随底盘库（docs/CHASSIS_LIBRARY.md §4）：
+//  ⚠️ 坐标约定跟随底盘库（docs/README.md §4）：
 //      +x = 车体前进，+y = 车体左移，wz 逆时针为正。
 //      **不是**旧 ChassisCommand 草案里的「vx 右 / vy 前」，那个已经废弃。
 //
