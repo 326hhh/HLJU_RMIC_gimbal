@@ -111,7 +111,7 @@ tail -f /tmp/gimbal.log        # 看日志
 
 ## 3. 目录结构
 
-**26 个源文件（14 头 + 12 源）/ 5056 行**，另加 `CMakeLists.txt`、`README.md` 与 `src/device/fire_worker.py`。
+**31 个源文件（17 头 + 14 源）/ 6829 行**，另加 `CMakeLists.txt`、`README.md` 与 `src/device/fire_worker.py`。
 
 ```
 gimbal/
@@ -129,6 +129,9 @@ gimbal/
 │   ├── device/
 │   │   ├── zdt_motor.hpp            单台电机：使能 / 速度 / 位置 / 急停 / 遥测轮询
 │   │   └── fire_control.hpp         水弹波箱：fork/exec Python worker，经管道发 `0`/`1`
+│   ├── imu/                         IMU（ICM-42688-P）：只给 pitch 提供绝对仰角
+│   │   ├── imu.hpp                  IImu 抽象 + ImuPitch 俯仰融合（互补滤波 + 创新门限）
+│   │   └── imu_i2c.hpp              ICM-42688-P I²C 驱动接口（地址自动识别）
 │   ├── gimbal/
 │   │   ├── axis.hpp                 单轴控制律：角速度斜坡 + 死区 + 软限位 + 回中 + 角度估计
 │   │   └── gimbal.hpp               双轴协调：统一时钟 + 两级看门狗 + 传输层 poll 去重
@@ -150,6 +153,9 @@ gimbal/
     │   ├── zdt_motor.cpp            物理量 ↔ ZDT 帧、遥测解析、传动比/脉冲换算
     │   ├── fire_control.cpp         fork/exec + 管道写 `1\n`/`0\n`，析构写 `0\nq\n`
     │   └── fire_worker.py           水弹波箱节拍进程（BOARD 引脚 12，高 80 ms / 低 120 ms）
+    ├── imu/
+    │   ├── imu_pitch.cpp            俯仰融合：asin(u·â) + 陀螺积分 + 创新门限
+    │   └── imu_i2c.cpp              寄存器配置/读取（不做软复位、写重试、地址自动识别）
     ├── gimbal/
     │   ├── axis.cpp                 单轴控制律（斜坡/死区/限位/回中）
     │   └── gimbal.cpp               双轴调度、看门狗、estop/home/enable 协调
@@ -162,12 +168,12 @@ gimbal/
 ```
 
 行数分布（判断改动影响面用）：
-`main.cpp` 1019 · `unified_serial.cpp` 356 · `mjpeg_server.cpp` 401 · `can_chassis_link.cpp` 278 ·
+`main.cpp` 2046 · `unified_serial.cpp` 356 · `mjpeg_server.cpp` 401 · `can_chassis_link.cpp` 278 ·
 `zdt_motor.cpp` 243 · `zdt_frame.cpp` 200 · `can_transport.cpp` 179 · `udp_control_link.cpp` 175 ·
-`axis.cpp` 153 · `gimbal.cpp` 111 · `itransport.cpp` 77 · `fire_control.cpp` 76 ·
+`axis.cpp` 153 · `imu_i2c.cpp` 171 · `gimbal.cpp` 111 · `imu_pitch.cpp` 81 · `itransport.cpp` 77 · `fire_control.cpp` 76 ·
 头文件：`control_link.hpp` 347 · `fake_transport.hpp` 204 · `chassis_link.hpp` 194 · `unified_serial.hpp` 146 ·
 `zdt_motor.hpp` 134 · `can_chassis_link.hpp` 121 · `zdt_codes.hpp` 104 · `zdt_frame.hpp` 97 · `axis.hpp` 94 ·
-`itransport.hpp` 91 · `gimbal.hpp` 89 · `udp_control_link.hpp` 75 · `can_transport.hpp` 61 · `fire_control.hpp` 31。
+`itransport.hpp` 91 · `gimbal.hpp` 89 · `imu.hpp` 86 · `udp_control_link.hpp` 75 · `imu_i2c.hpp` 58 · `can_transport.hpp` 61 · `fire_control.hpp` 31。
 
 > ★ = 协议/接口的关键文件，改动要三端（固件 ↔ Jetson ↔ PC 客户端）同步。
 
