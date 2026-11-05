@@ -23,6 +23,8 @@ set(GIMBAL_SOURCES
     src/transport/can_transport.cpp
     src/device/zdt_motor.cpp
     src/device/fire_control.cpp
+    src/imu/imu_pitch.cpp
+    src/imu/imu_i2c.cpp
     src/gimbal/axis.cpp
     src/gimbal/gimbal.cpp
     src/link/udp_control_link.cpp

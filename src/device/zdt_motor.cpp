@@ -13,6 +13,7 @@ double ZdtMotor::nowMs() {
 
 ZdtMotor::ZdtMotor(std::shared_ptr<ITransport> t, Config c)
     : transport_(std::move(t)), cfg_(c) {
+    spd_key_ = "spd:" + std::to_string(cfg_.addr);
     const double t0 = nowMs();
     const double gap = 5.0;   // 初始错开，避免所有遥测挤在同一拍
     polls_ = {
@@ -63,9 +64,10 @@ void ZdtMotor::setSpeedRpm(double signed_rpm) {
     const bool positive = signed_rpm >= 0.0;
     const bool ccw      = (positive != cfg_.invert_dir);
 
-    transport_->send(zdt::mkSpeed(cfg_.addr,
-                                  static_cast<uint16_t>(std::lround(a)),
-                                  ccw, cfg_.acc_default));
+    transport_->sendDedup(spd_key_,
+                          zdt::mkSpeed(cfg_.addr,
+                                       static_cast<uint16_t>(std::lround(a)),
+                                       ccw, cfg_.acc_default));
     shadow_rpm_       = a;
     shadow_spd_valid_ = true;
 }

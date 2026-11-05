@@ -148,7 +148,9 @@ std::vector<uint8_t> mkZeroPos(uint8_t addr) {
 }
 
 std::vector<uint8_t> mkClearStall(uint8_t addr) {
-    return {addr, static_cast<uint8_t>(Func::ClearStall), CHECKSUM_FIXED};
+    // 驱动板要求带固定数据字节 0x52，否则回 0xEE（命令不成立），保护永远解不开。
+    // 正确帧: Addr 0E 52 6B（见 docs/DEBUG_LOG.md §3）
+    return {addr, static_cast<uint8_t>(Func::ClearStall), 0x52, CHECKSUM_FIXED};
 }
 
 std::vector<uint8_t> mkGet(uint8_t addr, Func f) {

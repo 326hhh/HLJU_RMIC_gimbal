@@ -155,7 +155,8 @@ private:
                 const double   v = s.rpm;
                 const double   a = std::fabs(v) > 3000.0 ? 3000.0 : std::fabs(v);
                 const uint16_t m = static_cast<uint16_t>(std::lround(a));
-                rx.push_back(static_cast<uint8_t>(v < -0.5 ? 1 : 0));
+                // dir 字节约定与真机一致：1 = 正方向（见 docs/DEBUG_LOG.md §10）
+                rx.push_back(static_cast<uint8_t>(v < -0.5 ? 0 : 1));
                 rx.push_back(static_cast<uint8_t>((m >> 8) & 0xFF));
                 rx.push_back(static_cast<uint8_t>(m & 0xFF));
                 break;
@@ -164,7 +165,8 @@ private:
             case zdt::Func::GetPos: {
                 ++s.get_seen;
                 const uint32_t p = degToRaw(s.pos_deg);
-                rx.push_back(0x00);
+                // dir 字节约定与真机一致：1 = 正方向（位置累积器靠它定符号）
+                rx.push_back(0x01);
                 rx.push_back(static_cast<uint8_t>((p >> 24) & 0xFF));
                 rx.push_back(static_cast<uint8_t>((p >> 16) & 0xFF));
                 rx.push_back(static_cast<uint8_t>((p >> 8) & 0xFF));

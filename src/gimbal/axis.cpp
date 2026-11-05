@@ -43,10 +43,20 @@ void Axis::hold() {
     homing_   = false;
 }
 
-void Axis::zeroHere() {
+void Axis::zeroHere(bool zero_driver) {
     est_angle_ = 0.0;
     at_limit_  = false;
-    motor_->zeroPosition();
+    if (zero_driver) {
+        motor_->zeroPosition();
+    } else {
+        motor_->resetPosAccum();   // 只重设软件基准，不动驱动板内部计数
+    }
+}
+
+void Axis::setSoftLimits(double mn, double mx) {
+    if (mn > mx) std::swap(mn, mx);
+    cfg_.min_deg = mn;
+    cfg_.max_deg = mx;
 }
 
 void Axis::goHome(double dps, double tol_deg) {

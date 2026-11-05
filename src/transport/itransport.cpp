@@ -16,15 +16,35 @@ int64_t nowUs() {
 void ITransport::send(const std::vector<uint8_t>& frame, bool urgent) {
     if (txq_.size() >= txq_max_) {
         txq_.pop_front();
+        txkeys_.pop_front();
         ++stats_.tx_dropped;
     }
     // urgent = 插队到最前，**不是**清空队列。
     // 一根总线常挂多台电机，清空会把别的电机刚排进去的命令一起误杀。
     if (urgent) {
         txq_.push_front(frame);
+        txkeys_.push_front(std::string());
     } else {
         txq_.push_back(frame);
+        txkeys_.push_back(std::string());
     }
+}
+
+void ITransport::sendDedup(const std::string& key, const std::vector<uint8_t>& frame) {
+    for (size_t i = 0; i < txq_.size(); ++i) {
+        if (txkeys_[i] == key) {
+            txq_[i] = frame;   // 原地替换：保留位置，不改变先后
+            return;
+        }
+    }
+    if (txq_.size() >= txq_max_) {
+        txq_.pop_front();
+        txkeys_.pop_front();
+        ++stats_.tx_dropped;
+    }
+    // 状态类命令优先：插到队首，让电机尽快拿到"当前值"
+    txq_.push_front(frame);
+    txkeys_.push_front(key);
 }
 
 bool ITransport::popFrame(zdt::Frame& out) {
@@ -63,6 +83,7 @@ bool ITransport::nextTx(std::vector<uint8_t>& out) {
     if (txq_.empty() || !txReady()) return false;
     out = std::move(txq_.front());
     txq_.pop_front();
+    if (!txkeys_.empty()) txkeys_.pop_front();
     last_tx_us_ = nowUs();
     return true;
 }

@@ -119,6 +119,7 @@ private:
     std::shared_ptr<ITransport>   transport_;
     Config                        cfg_;
     Status                        st_;
+    std::string                   spd_key_;   ///< 速度帧在传输层的合并 key
     std::vector<PollItem>         polls_;
     bool                          shadow_en_valid_  = false;
     bool                          shadow_enabled_   = false;

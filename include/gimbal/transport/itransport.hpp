@@ -54,6 +54,11 @@ public:
     /// 入队一帧。urgent=true 时清空队列插队（急停用）
     void send(const std::vector<uint8_t>& frame, bool urgent = false);
 
+    /// 入队一帧并"按 key 合并"：队列里已有同 key 的帧时**原地替换**成最新值，
+    /// 没有则插到队首（优先于普通遥测帧）。
+    /// 用于速度这类"状态量"命令——总线饱和时应执行最新指令，而不是排队里的旧指令。
+    void sendDedup(const std::string& key, const std::vector<uint8_t>& frame);
+
     /// 取任意一帧
     bool popFrame(zdt::Frame& out);
     /// 只取发给指定地址的帧（一总线多电机时用）
@@ -79,6 +84,7 @@ protected:
     void setGapUs(int64_t us) { gap_us_ = us; }
 
     std::deque<std::vector<uint8_t>> txq_;
+    std::deque<std::string>          txkeys_;   ///< 与 txq_ 一一对应的合并 key（空 = 不可合并）
     zdt::Parser                      parser_;
     std::deque<zdt::Frame>           rxq_;
     TransportStats                   stats_;

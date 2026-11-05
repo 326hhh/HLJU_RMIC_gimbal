@@ -49,7 +49,10 @@ public:
     /// 停止转动（保持使能，抱死）
     void hold();
     /// 把当前角度估计与电机零点对齐（应在机械零点调用）
-    void zeroHere();
+    /// @param zero_driver true 时同时下发驱动板 0x0A 归零；false 只重设软件基准
+    void zeroHere(bool zero_driver = true);
+    /// 临时修改软限位（会话过渡期放宽用；到位后改回正常范围）
+    void setSoftLimits(double mn, double mx);
     /// 回到 0°
     void goHome(double dps = 60.0, double tol_deg = 2.0);
     /// 急停：驱动板立即停止 + 失能
