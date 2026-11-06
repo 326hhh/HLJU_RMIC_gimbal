@@ -113,7 +113,15 @@ void Axis::update(double dt) {
     }
 
     // ---- 2. 斜坡限幅（角加速度约束）----
-    const double max_step = cfg_.rate_accel_dps2 * dt;
+    // 末段软化：速度已经很小、并且在往 0 收，就用更缓的斜坡收尾，
+    // 减少停止瞬间的动量/驱动板过冲引起的抖动。
+    double ramp = cfg_.rate_accel_dps2;
+    if (cfg_.rate_soft_zone > 0.0 &&
+        std::fabs(rate_act_) <= cfg_.rate_soft_zone &&
+        std::fabs(rate_cmd_) < std::fabs(rate_act_)) {
+        ramp *= (cfg_.rate_soft_ratio > 0.0 ? cfg_.rate_soft_ratio : 1.0);
+    }
+    const double max_step = ramp * dt;
     double       d        = rate_cmd_ - rate_act_;
     if (d > max_step) d = max_step;
     if (d < -max_step) d = -max_step;

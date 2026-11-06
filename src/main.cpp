@@ -106,7 +106,10 @@ struct Options {
 
     // ---- pitch 会话状态机（PC 接管 -> 抬 30° 定零；PC 结束 -> 放下锁死）----
     bool        pitch_session   = true;    ///< --no-pitch-session 关闭，速率直通
-    double      pitch_rise_deg  = 40.0;    ///< 相对会话起点上抬的角度 = 新的 0°
+    double      pitch_rise_deg  = 50.0;    ///< 相对会话起点上抬的角度 = 新的 0°
+    double      pitch_rise_extra = 0.0;    ///< 初始上抬在 50° 基础上再微调几度
+    double      pitch_mech_travel = 85.0;  ///< 机械行程：相对会话起点最多能抬多少度（安全上限）
+    double      pitch_lower_deg = -40.0;   ///< "放下"的目标角（相对 0°；默认 -40）
     double      pitch_rise_rate = 60.0;    ///< 抬升/放下期间最大角速度 °/s
     double      pitch_servo_kp  = 2.0;     ///< 位置伺服 P 增益（°/s 每 °）
     double      pitch_servo_tol = 1.5;     ///< 到位容差 °
@@ -126,11 +129,15 @@ struct Options {
     // ---- 绝对仰角保持（动态补偿；需要 IMU 在抬升时定过"水平"）----
     bool        pitch_abs     = false;     ///< 速率指令积分成绝对目标，用 IMU 闭环保持
     double      abs_kp        = 3.0;       ///< 绝对伺服 P 增益 (1/s)
+    double      damp_k        = 0.0;       ///< 主动阻尼系数（0=关；用 IMU 角速度压停车振铃）
 
     // ---- 手感（每轴独立，可命令行调）----
     int         tx_gap_ms   = 8;      ///< ZDT 命令最小间隔（越小指令越及时，别低于 3）
     double      yaw_ramp    = 600.0;  ///< yaw 角加速度 °/s²（0→180 约 0.3 s）
     double      pitch_ramp  = 600.0;  ///< pitch 角加速度 °/s²（0→120 约 0.2 s）
+    double      soft_zone   = 0.0;    ///< 末段软化区间 °/s（0=关）
+    double      soft_ratio  = 0.4;    ///< 末段软化后的斜坡比例
+    std::string imu_log     = "";     ///< --imu-log：把每帧 IMU 数据写文件（调抖动用）
     double      hold_delay  = 0.12;   ///< 停手后开始衰减的延时 s
     double      hold_tau    = 0.05;   ///< 停手衰减时间常数 s
     double      deadband    = 0.5;    ///< 速度死区 °/s
@@ -171,14 +178,21 @@ static void usage(const char* a0) {
         "  --imu-probe            只看 IMU（打印 WHO_AM_I 与角度），不控车\n"
         "  --pitch-abs            绝对仰角保持：方向键给速率，松手保持绝对仰角\n"
         "  --abs-kp <f>           绝对伺服 P 增益 (默认 3.0)\n"
+        "  --damp-k <f>           主动阻尼系数 (默认 0=关；重负载停车振铃可试 0.4~0.6)\n"
         "  --tx-gap <ms>          ZDT 命令最小间隔 (默认 8；12 会在抬/降速时挤占带宽)\n"
         "  --yaw-ramp <dps2>      yaw 角加速度 (默认 600)\n"
         "  --pitch-ramp <dps2>    pitch 角加速度 (默认 600)\n"
         "  --hold-delay <s>       停手后开始衰减的延时 (默认 0.12)\n"
         "  --hold-tau <s>         停手衰减时间常数 (默认 0.05)\n"
         "  --deadband <dps>       速度死区 (默认 0.5)\n"
+        "  --soft-zone <dps>      末段软化区间 (默认 0=关；重负载停抖可试 8~12)\n"
+        "  --soft-ratio <f>       末段软化后的斜坡比例 (默认 0.4)\n"
+        "  --imu-log <文件>       把每帧 IMU 数据写文件（t 俯仰 角速度 gz）\n"
         "  --no-pitch-session     关闭 pitch 会话状态机（旧行为：PC 速率直通）\n"
-        "  --pitch-rise <deg>     会话开始时相对起点上抬并定为 0° (默认 40)\n"
+        "  --pitch-rise <deg>     会话开始时相对起点上抬并定为 0° (默认 50)\n"
+        "  --pitch-mech-travel <deg> 机械行程：相对会话起点最多能抬多少度 (默认 85)\n"
+        "  --pitch-lower <deg>    放下目标角，相对 0° (默认 -40)\n"
+        "  --pitch-rise-extra <deg> 初始上抬再微调几度 (默认 0)\n"
         "  --pitch-rise-rate <dps> 抬升/放下最大角速度 (默认 60)\n"
         "  --pitch-session-end <s> 无控制包多久后放下锁死 (默认 0.5)\n"
         "  --pitch-servo-kp <f>   抬升/放下位置伺服 P 增益 (默认 2.0)\n"
@@ -695,6 +709,9 @@ public:
 
     struct Params {
         double rise_deg  = 40.0;   ///< 相对会话起点上抬的角度（= 新 0°）
+        double rise_extra_deg = 0.0;  ///< 在目标之上再抬的角度
+        double mech_travel_deg = 85.0;///< 机械行程（相对会话起点），抬升/限位都不许越界
+        double lower_deg       = -40.0;///< "放下"目标角（相对 0°）
         double rate_max  = 60.0;   ///< 过渡期间最大角速度 °/s
         double kp        = 2.0;    ///< 位置伺服 P 增益（°/s 每 °）
         double tol_deg   = 1.5;    ///< 到位容差
@@ -704,8 +721,18 @@ public:
 
         // ---- IMU（每拍由主循环填）----
         bool   imu_ok        = false;  ///< 本拍 IMU 可用
+        bool   imu_wait      = false;  ///< IMU 在线但零偏还没标定好：会话先等
         double imu_pitch_deg = 0.0;    ///< 当前枪管绝对仰角（已含零位）
         bool*  imu_zero_req  = nullptr;///< 抬升到位时置 true，让主循环给 IMU 清零
+
+        // ---- 打滑检测：编码器增量 vs IMU 增量 ----
+        double slip_win_s   = 0.5;   ///< 判定窗口 s
+        double slip_max     = 1.6;   ///< est 增量 / IMU 增量 超过它判定打滑
+        double slip_min_deg = 2.0;   ///< 窗口内 est 至少动了这么多才判（防噪声）
+
+        // ---- 主动阻尼（压停车振铃）----
+        double imu_rate_dps = 0.0;  ///< 本拍枪口俯仰角速度（IMU）
+        double damp_k       = 0.0;  ///< 阻尼系数（0=关）
 
         // ---- 绝对仰角保持（动态补偿）----
         bool   abs_hold      = false;  ///< 速率指令积分成绝对目标，再用 IMU 闭环
@@ -751,6 +778,12 @@ private:
     bool   warned_      = false;  ///< "等待反馈/使能"告警去重
     bool   zeroed_      = false;  ///< 0° 是否已由本会话建立（决定放下目标的坐标系）
     double entry_deg_   = 0.0;    ///< 进入过渡模式时的角度（无进展检测用）
+    double slip_t_      = 0.0;    ///< 打滑判定窗口计时
+    double slip_est_    = 0.0;    ///< 窗口内 est 增量
+    double slip_imu_    = 0.0;    ///< 窗口内 IMU 增量
+    double est_prev_    = 0.0;    ///< 上一拍 est（算增量）
+    bool   slip_warned_ = false;  ///< 控制阶段打滑告警去重
+    bool   have_zero_   = false;  ///< 本进程内是否已建立过 0°（建立后回工作位，避免零点爬升）
     bool   used_imu_    = false;  ///< 本次抬升是否用 IMU 定的"水平"
     double rest_est_    = 0.0;    ///< 会话起点在新基准（0°=水平）下的位置
     double abs_target_deg_ = 0.0; ///< 绝对模式的目标仰角
@@ -759,6 +792,23 @@ private:
     double target_deg_  = 0.0;    ///< 当前过渡目标
     double age_s_       = 0.0;    ///< 当前模式持续时长
 };
+
+// ---------------------------------------------------------------------------
+// 主动阻尼：停车后轴会以 3~5 Hz 振铃（负载惯性 + 驱动板位置环），
+// 用枪口 IMU 的角速度做速度反馈"吃掉"振铃能量：
+//   仅在用户没有给速率指令（|pc| 很小）时生效，避免和正常控制打架。
+// ---------------------------------------------------------------------------
+namespace {
+inline double applyDamping(double rate, const PitchSession::Params& p,
+                           double pc_rate) {
+    if (p.damp_k <= 0.0 || !p.imu_ok) return rate;
+    if (std::fabs(pc_rate) >= 2.0) return rate;   // 用户正在给指令：不干预
+    double r = rate - p.damp_k * p.imu_rate_dps;
+    if (r >  p.rate_max) r =  p.rate_max;
+    if (r < -p.rate_max) r = -p.rate_max;
+    return r;
+}
+}  // namespace
 
 const char* PitchSession::modeName() const {
     switch (mode_) {
@@ -775,26 +825,38 @@ void PitchSession::beginRaise(Axis& pitch, const Params& p) {
     zeroed_     = false;
     entry_deg_  = rest_deg_;
     abs_armed_  = false;
-    if (p.imu_ok) {
-        // 有 IMU：目标不是"抬固定角度"，而是"抬到枪管水平"。
-        // 当前仰角为 imu_pitch_deg，要转平就得让 est 减少这么多。
-        target_deg_ = rest_deg_ - p.imu_pitch_deg;
-        if (target_deg_ < rest_deg_)        target_deg_ = rest_deg_;
-        if (target_deg_ > rest_deg_ + 120.0) target_deg_ = rest_deg_ + 120.0;
-        used_imu_ = true;
-        std::printf("[pitch] 会话开始（IMU）：当前仰角 %.1f° -> 抬到水平（est %.2f°）\n",
-                    p.imu_pitch_deg, target_deg_);
+    if (have_zero_) {
+        // 已经建立过 0°：直接回工作位。
+        // （如果还"相对当前位抬 50°，而放下只到 -40°"，每轮零点会爬升 10°，
+        //   几轮之后枪口就顶到限位/机械上限，表现就是"向上抬不动、向下能动"）
+        target_deg_ = 0.0;
+        if (target_deg_ > rest_deg_ + p.mech_travel_deg) {
+            target_deg_ = rest_deg_ + p.mech_travel_deg;
+        }
+        std::printf("[pitch] 会话开始：回到已建立的 0°（当前 est %.2f°，抬 %.1f°）%s\n",
+                    rest_deg_, target_deg_ - rest_deg_,
+                    p.imu_ok ? "（IMU 同步清零）" : "");
     } else {
-        target_deg_ = rest_deg_ + p.rise_deg;
-        used_imu_   = false;
-        std::printf("[pitch] 会话开始：起点 %.2f° -> 目标 %.2f°（%+.0f°），到达后定为 0°\n",
-                    rest_deg_, target_deg_, p.rise_deg);
+        // 首次：从会话起点抬 rise 度，抬到位就是新的 0°。
+        // 机械行程 clamp：绝不允许抬过机械行程。
+        const double rise = p.rise_deg + p.rise_extra_deg;
+        target_deg_ = rest_deg_ + rise;
+        if (target_deg_ > rest_deg_ + p.mech_travel_deg) {
+            target_deg_ = rest_deg_ + p.mech_travel_deg;
+            std::printf("[pitch] 抬升目标被机械行程 %.0f° 截断\n", p.mech_travel_deg);
+        }
+        std::printf("[pitch] 会话开始：起点 %.2f° -> 上抬 %.0f°（est %.2f°），到达后定为 0°%s\n",
+                    rest_deg_, target_deg_ - rest_deg_, target_deg_,
+                    p.imu_ok ? "（IMU 同步清零）" : "");
     }
+    used_imu_ = p.imu_ok;   // IMU 只决定"到点后是否同步清零 / 是否可用绝对模式"
     // 过渡期间放宽软限位：此刻 est 仍按旧基准计算，±limit 会误拦
     pitch.setSoftLimits(-180.0, 180.0);
     pitch.motor()->clearStall();   // 顺手清一次旧的堵转保护（帧已按手册补 0x52）
     mode_  = Mode::kRaising;
     age_s_ = 0.0;
+    slip_t_ = slip_est_ = slip_imu_ = 0.0;
+    est_prev_ = entry_deg_;
 }
 
 void PitchSession::beginLower(Axis& pitch, const Params& p) {
@@ -802,13 +864,22 @@ void PitchSession::beginLower(Axis& pitch, const Params& p) {
     // 没定义过（例如抬升途中退出）：起点就是 rest_deg_（旧基准）。
     // 注意：rise 可能大于 limit（如抬 40° 而限位 ±30°），放下必须能回到真正的
     // 静止位，所以过渡期把下限临时放宽到目标下方 5°，到位后仍是 ±limit。
-    target_deg_ = zeroed_ ? rest_est_ : rest_deg_;
+    if (zeroed_) {
+        // 放下目标：默认 -40°（相对 0°），并夹在 [会话起点, 0] 之间
+        target_deg_ = p.lower_deg;
+        if (target_deg_ < rest_est_) target_deg_ = rest_est_;   // 不能低于会话起点
+        if (target_deg_ > 0.0)       target_deg_ = 0.0;
+    } else {
+        target_deg_ = rest_deg_;   // 抬升中途退出：回会话起点
+    }
     entry_deg_  = pitch.estAngleDeg();
     abs_armed_  = false;
-    pitch.setSoftLimits(target_deg_ - 5.0, p.limit_max);
+    // 下限就是放下目标：不再允许 -5°，避免往机械下止点里顶
+    pitch.setSoftLimits(target_deg_, p.limit_max);
     mode_  = Mode::kLowering;
     age_s_ = 0.0;
-    std::printf("[pitch] PC 控制结束：放下到 %.1f°（会话起点姿态）\n", target_deg_);
+    std::printf("[pitch] PC 控制结束：放下到 %.1f°（会话起点 %.1f°）\n",
+                target_deg_, rest_est_);
 }
 
 void PitchSession::abortTo(Axis& pitch, const Params& p, const char* why) {
@@ -827,6 +898,34 @@ double PitchSession::step(double dt, bool udp_live, bool udp_hold,
     *send = true;
     age_s_ += dt;
 
+    // ---- 打滑检测：运动时 est 增量应约等于 IMU 增量 ----
+    //   联轴器打滑时电机会空转（est 猛涨）而枪口不动（IMU 不动），比例如实暴露。
+    const bool slip_watch = (mode_ == Mode::kRaising) ||
+                            (mode_ == Mode::kActive && !p.abs_hold);
+    if (slip_watch) {
+        const double est_now = pitch.estAngleDeg();
+        slip_est_ += std::fabs(est_now - est_prev_);
+        est_prev_  = est_now;
+        if (p.imu_ok) slip_imu_ += std::fabs(p.imu_rate_dps) * dt;
+        slip_t_ += dt;
+        if (slip_t_ >= p.slip_win_s) {
+            const bool slip = p.imu_ok && slip_est_ >= p.slip_min_deg &&
+                              slip_imu_ < slip_est_ / p.slip_max;
+            if (slip) {
+                if (mode_ == Mode::kRaising) {
+                    abortTo(pitch, p, "疑似联轴器打滑（电机在转、枪口没跟上）");
+                    return 0.0;
+                }
+                if (!slip_warned_) {
+                    slip_warned_ = true;
+                    std::printf("[pitch] 警告：疑似联轴器打滑（窗口内 est %.1f° / IMU %.1f°），"
+                                "请检查联轴器顶丝\n", slip_est_, slip_imu_);
+                }
+            }
+            slip_t_ = slip_est_ = slip_imu_ = 0.0;
+        }
+    }
+
     const auto stalled = [&pitch]() {
         const auto& s = pitch.motorStatus();
         return s.stalled || s.stall_prot;
@@ -841,6 +940,14 @@ double PitchSession::step(double dt, bool udp_live, bool udp_hold,
     if (mode_ == Mode::kLocked) {
         // 未授权 / 没控制端 / 缺反馈：本拍不下发，交给看门狗抱死
         if (!udp_live || latched_) {
+            *send = false;
+            return 0.0;
+        }
+        if (p.imu_wait) {
+            if (!warned_) {
+                warned_ = true;
+                std::printf("[pitch] 等待 IMU 零偏标定（保持不动约 2 s）…\n");
+            }
             *send = false;
             return 0.0;
         }
@@ -868,16 +975,29 @@ double PitchSession::step(double dt, bool udp_live, bool udp_hold,
         const double err = target_deg_ - pitch.estAngleDeg();
         if (std::fabs(err) <= p.tol_deg) {
             pitch.zeroHere(/*zero_driver=*/false);   // 只在软件侧定义 0°
-            pitch.setSoftLimits(p.limit_min, p.limit_max);
-            rest_est_ = -(target_deg_ - rest_deg_);  // 会话起点在新基准下的位置
+            const double travel = target_deg_ - rest_deg_;   // 已走的抬升行程
+            rest_est_ = -travel;                              // 会话起点在新基准下的位置
+            // 软限位收进机械窗口：上限不超过 mech_travel-travel，下限不低于会话起点
+            double lo = p.limit_min;
+            double hi = p.limit_max;
+            if (hi > p.mech_travel_deg - travel) hi = p.mech_travel_deg - travel;
+            if (lo < -travel)                    lo = -travel;
+            if (p.limit_max > p.mech_travel_deg - travel + 0.5) {
+                std::printf("[pitch] 警告：±%.0f° 软限位已贴近机械行程（余量 %.1f°）\n",
+                            p.limit_max, p.mech_travel_deg - travel - p.limit_max);
+            }
+            pitch.setSoftLimits(lo, hi);
             if (used_imu_ && p.imu_zero_req) *p.imu_zero_req = true;
-            std::printf("[pitch] 抬升到位（停于 %.2f°），该姿态定为 0°（%s），"
-                        "限位 %+.0f/%+.0f°；会话起点 %.1f°\n",
-                        pitch.estAngleDeg(), used_imu_ ? "IMU 真水平" : "相对水平",
-                        p.limit_min, p.limit_max, rest_est_);
-            mode_   = Mode::kActive;
+            std::printf("[pitch] 抬升到位（停于 %.2f°），该姿态定为 0°，限位 %+.0f/%+.0f°%s；"
+                        "会话起点 %.1f°\n",
+                        pitch.estAngleDeg(), lo, hi,
+                        used_imu_ ? "（IMU 已清零）" : "", rest_est_);
+            mode_    = Mode::kActive;
             age_s_   = 0.0;
             zeroed_  = true;
+            have_zero_ = true;   // 0° 已建立：后续会话回这个位，不再累加抬升
+            slip_t_ = slip_est_ = slip_imu_ = 0.0;
+            est_prev_ = 0.0;
             return 0.0;
         }
         if (stalled()) {
@@ -924,9 +1044,10 @@ double PitchSession::step(double dt, bool udp_live, bool udp_hold,
                 double r = (abs_target_deg_ - p.imu_pitch_deg) * p.abs_kp;
                 if (r >  p.rate_max) r =  p.rate_max;
                 if (r < -p.rate_max) r = -p.rate_max;
+                r = applyDamping(r, p, pc_pitch_dps);
                 return r;
             }
-            return udp_hold ? 0.0 : pc_pitch_dps;
+            return applyDamping(udp_hold ? 0.0 : pc_pitch_dps, p, pc_pitch_dps);
         }
     }
 
@@ -1242,15 +1363,19 @@ static void absHoldSelftest() {
 
     double tilt = 0.0;      // 底盘倾斜（世界坐标下枪口多出来的仰角）
     bool   zeroed = false;  // IMU 是否已被会话清零
+    double imu_prev = 0.0;  // 上一拍的假 IMU 角（算 imu_rate）
 
     auto tick = [&](double secs, double pc_rate) {
         const auto t0 = std::chrono::steady_clock::now();
         while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
                    .count() < secs) {
             // 假 IMU：抬升前 est=0 表示静止位（朝下 40°），清零后 0° = 水平
+            const double imu_now = zeroed ? (g.pitch().estAngleDeg() + tilt)
+                                          : (g.pitch().estAngleDeg() - 40.0);
             sp.imu_ok        = true;
-            sp.imu_pitch_deg = zeroed ? (g.pitch().estAngleDeg() + tilt)
-                                      : (g.pitch().estAngleDeg() - 40.0);
+            sp.imu_pitch_deg = imu_now;
+            sp.imu_rate_dps  = (imu_now - imu_prev) / 0.01;
+            imu_prev         = imu_now;
             bool         send = false;
             const double pr =
                 sess.step(0.01, /*udp_live=*/true, /*udp_hold=*/false, pc_rate,
@@ -1473,6 +1598,10 @@ static int runMain(Options o) {
     gc.pitch.rate_decay_tau  = o.hold_tau;
     gc.yaw.rate_deadband_dps = o.deadband;
     gc.pitch.rate_deadband_dps = o.deadband;
+    gc.yaw.rate_soft_zone    = o.soft_zone;
+    gc.pitch.rate_soft_zone  = o.soft_zone;
+    gc.yaw.rate_soft_ratio   = o.soft_ratio;
+    gc.pitch.rate_soft_ratio = o.soft_ratio;
 
     Gimbal gimbal(yaw_motor, pitch_motor, gc);
 
@@ -1510,6 +1639,17 @@ static int runMain(Options o) {
             std::printf("[main] 警告：开火串口 %s 打开失败（%s）——后台每 0.5 s 重试，"
                         "云台/底盘不受影响\n",
                         o.fire_dev.c_str(), fire->stats().last_error.c_str());
+        }
+    }
+
+    // ---- IMU 数据记录（调抖动/标定用）----
+    FILE* imu_log_fp = nullptr;
+    if (!o.imu_log.empty()) {
+        imu_log_fp = std::fopen(o.imu_log.c_str(), "w");
+        if (!imu_log_fp) {
+            std::printf("[imu] 打不开日志文件 %s\n", o.imu_log.c_str());
+        } else {
+            std::printf("[imu] 记录到 %s（t 俯仰 角速度 gz）\n", o.imu_log.c_str());
         }
     }
 
@@ -1591,13 +1731,11 @@ static int runMain(Options o) {
         std::printf("  IMU     : 未接入（纯编码器方案）\n");
     }
     if (o.pitch_session) {
-        if (imu) {
-            std::printf("  pitch 会话: 开（首包后抬到 IMU 真水平并定 0°；%.1f s 无包放下锁死）\n",
-                        o.pitch_end_s);
-        } else {
-            std::printf("  pitch 会话: 开（首包后上抬 %+.0f° 定为 0°；%.1f s 无包放下并锁死）\n",
-                        o.pitch_rise_deg, o.pitch_end_s);
-        }
+        std::printf("  pitch 会话: 开（首包后上抬 %.0f° 定为 0°，限位 ±%.0f°，机械行程 %.0f°；"
+                    "%.1f s 无包放下锁死）%s\n",
+                    o.pitch_rise_deg + o.pitch_rise_extra, o.pitch_max,
+                    o.pitch_mech_travel, o.pitch_end_s,
+                    imu ? "（IMU 同步清零）" : "");
     } else {
         std::printf("  pitch 会话: 关（--no-pitch-session，速率直通）\n");
     }
@@ -1647,6 +1785,9 @@ static int runMain(Options o) {
     PitchSession sess;
     PitchSession::Params pp;
     pp.rise_deg  = o.pitch_rise_deg;
+    pp.rise_extra_deg = o.pitch_rise_extra;
+    pp.mech_travel_deg = o.pitch_mech_travel;
+    pp.lower_deg       = o.pitch_lower_deg;
     pp.rate_max  = o.pitch_rise_rate;
     pp.kp        = o.pitch_servo_kp;
     pp.tol_deg   = o.pitch_servo_tol;
@@ -1860,35 +2001,56 @@ static int runMain(Options o) {
             } else {
                 ImuSample ismp;
                 if (imu->read(&ismp)) {
-                    if (!imu_bias_done) {
-                        // 开机静止 2 s 估陀螺零偏；期间有明显运动（方差大）就重来
-                        const double g = (o.imu_gyro_axis == 0) ? ismp.gx
+                    const double g_raw = (o.imu_gyro_axis == 0) ? ismp.gx
                                        : (o.imu_gyro_axis == 1) ? ismp.gy : ismp.gz;
-                        imu_bias_sum  += g;
-                        imu_bias_sum2 += g * g;
-                        if (++imu_bias_n >= kImuBiasWin) {
-                            const double mean = imu_bias_sum / imu_bias_n;
-                            const double var  = imu_bias_sum2 / imu_bias_n - mean * mean;
-                            const double sd   = (var > 0.0) ? std::sqrt(var) : 0.0;
-                            if (sd < 1.5) {
-                                ImuPitch::Config c = imu_pitch.cfg();
-                                c.gyro_bias_dps = mean;
-                                imu_pitch.setConfig(c);
-                                imu_pitch.reset();   // 用扣掉零偏的数据重新播种
-                                imu_bias_done = true;
-                                std::printf("[imu] 陀螺零偏标定: %+.2f°/s（轴 %d，σ=%.2f）\n",
-                                            mean, o.imu_gyro_axis, sd);
-                            } else {
-                                imu_bias_n = 0;
-                                imu_bias_sum = imu_bias_sum2 = 0.0;
-                                std::printf("[imu] 标定期间检测到运动（σ=%.2f°/s），"
-                                            "重新标定\n", sd);
+                    if (!imu_bias_done) {
+                        // 只在"安静"的样本上估零偏：与当前均值偏差 >5°/s 的样本直接丢掉，
+                        // 这样即使会话立刻开始、云台在动，也能等它停下来的间隙攒够样本。
+                        const bool warm = imu_bias_n >= 5;
+                        const double mean_now = warm ? imu_bias_sum / imu_bias_n : 0.0;
+                        if (!warm || std::fabs(g_raw - mean_now) <= 5.0) {
+                            imu_bias_sum  += g_raw;
+                            imu_bias_sum2 += g_raw * g_raw;
+                            if (++imu_bias_n >= kImuBiasWin) {
+                                const double mean = imu_bias_sum / imu_bias_n;
+                                const double var  = imu_bias_sum2 / imu_bias_n - mean * mean;
+                                const double sd   = (var > 0.0) ? std::sqrt(var) : 0.0;
+                                if (sd < 1.5) {
+                                    ImuPitch::Config c = imu_pitch.cfg();
+                                    c.gyro_bias_dps = mean;
+                                    imu_pitch.setConfig(c);
+                                    imu_pitch.reset();   // 用扣掉零偏的数据重新播种
+                                    imu_bias_done = true;
+                                    std::printf("[imu] 陀螺零偏标定: %+.2f°/s（轴 %d，σ=%.2f）\n",
+                                                mean, o.imu_gyro_axis, sd);
+                                } else {
+                                    imu_bias_n = 0;
+                                    imu_bias_sum = imu_bias_sum2 = 0.0;
+                                }
                             }
                         }
-                    } else {
+                    }
+                    // 标定完成（含完成的那一拍）就喂融合：否则会话会抢先用编码器兜底
+                    if (imu_bias_done) {
                         imu_pitch.update(ismp, dt_target);
                         imu_ok   = true;
                         imu_deg  = imu_pitch.pitchDeg();
+                    }
+                    if (imu_log_fp) {
+                        // t / IMU 俯仰 / 角速度 / 原始 gz / 编码器估计角 / 状态位
+                        const auto& pst = gimbal.pitch().motorStatus();
+                        const int  fl  = (pst.enabled ? 1 : 0) | (pst.stalled ? 2 : 0) |
+                                         (pst.stall_prot ? 4 : 0) |
+                                         (pst.lim_left ? 8 : 0) | (pst.lim_right ? 16 : 0);
+                        std::fprintf(imu_log_fp,
+                                     "%.4f %.3f %.3f %.2f %.3f %d %.2f %.3f %.2f\n", t_imu,
+                                     imu_bias_done ? imu_deg : 0.0,
+                                     imu_pitch.rateDps(), g_raw,
+                                     gimbal.pitch().estAngleDeg(), fl,
+                                     pst.speed_rpm,
+                                     gimbal.yaw().estAngleDeg(),
+                                     gimbal.yaw().motorStatus().speed_rpm);
+                        std::fflush(imu_log_fp);
                     }
                     imu_fail = 0;
                 } else if (++imu_fail > 50) {
@@ -1901,7 +2063,7 @@ static int runMain(Options o) {
         if (imu_zero_req) {
             imu_pitch.zeroHere();
             imu_zero_req = false;
-            std::printf("[pitch] IMU 已在当前姿态清零（0° = 真水平）\n");
+            std::printf("[pitch] IMU 已在当前姿态清零（0° = 本次抬升到位姿态）\n");
         }
 
         // ---- 3d. 云台速率：pitch 走会话状态机，yaw 跟随 PC ----
@@ -1911,7 +2073,10 @@ static int runMain(Options o) {
                 udp_seen && (t_now - last_udp_s) <= o.pitch_end_s;
             bool send = false;
             pp.imu_ok        = imu_ok;
+            pp.imu_wait      = (imu != nullptr) && !imu_bias_done;
             pp.imu_pitch_deg = imu_deg;
+            pp.imu_rate_dps  = imu_ok ? imu_pitch.rateDps() : 0.0;
+            pp.damp_k        = o.damp_k;
             const double pr = sess.step(dt_target, udp_live, udp_hold,
                                         udp_pitch_dps, gimbal.pitch(), pp, &send);
             if (send) {
@@ -1965,6 +2130,10 @@ static int runMain(Options o) {
     }
     gimbal.hold();
     for (int i = 0; i < 30; ++i) gimbal.step(dt_target);
+    if (imu_log_fp) {
+        std::fclose(imu_log_fp);
+        imu_log_fp = nullptr;
+    }
     std::printf("[main] 电机保持使能（抱死）；如需松轴请手动失能\n");
 
     if (chassis) {
@@ -2024,6 +2193,7 @@ int main(int argc, char** argv) {
         else if (a == "--imu-probe")                   o.imu_probe = true;
         else if (a == "--pitch-abs")                   o.pitch_abs = true;
         else if (a == "--abs-kp")                      o.abs_kp = next(o.abs_kp);
+        else if (a == "--damp-k")                      o.damp_k = next(o.damp_k);
         else if (a == "--tx-gap")                      o.tx_gap_ms = nexti(o.tx_gap_ms);
         else if (a == "--yaw-ramp")                    o.yaw_ramp = next(o.yaw_ramp);
         else if (a == "--pitch-ramp")                  o.pitch_ramp = next(o.pitch_ramp);
@@ -2032,7 +2202,13 @@ int main(int argc, char** argv) {
         else if (a == "--deadband")                    o.deadband = next(o.deadband);
         else if (a == "--no-pitch-session")            o.pitch_session = false;
         else if (a == "--pitch-rise")                  o.pitch_rise_deg = next(o.pitch_rise_deg);
+        else if (a == "--pitch-rise-extra")            o.pitch_rise_extra = next(o.pitch_rise_extra);
+        else if (a == "--pitch-mech-travel")           o.pitch_mech_travel = next(o.pitch_mech_travel);
+        else if (a == "--pitch-lower")                 o.pitch_lower_deg = next(o.pitch_lower_deg);
         else if (a == "--pitch-rise-rate")             o.pitch_rise_rate = next(o.pitch_rise_rate);
+        else if (a == "--soft-zone")                   o.soft_zone = next(o.soft_zone);
+        else if (a == "--soft-ratio")                  o.soft_ratio = next(o.soft_ratio);
+        else if (a == "--imu-log" && i + 1 < argc)     o.imu_log = argv[++i];
         else if (a == "--pitch-session-end")           o.pitch_end_s = next(o.pitch_end_s);
         else if (a == "--pitch-servo-kp")              o.pitch_servo_kp = next(o.pitch_servo_kp);
         else if (a == "--pitch-servo-tol")             o.pitch_servo_tol = next(o.pitch_servo_tol);

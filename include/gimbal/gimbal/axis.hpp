@@ -37,6 +37,10 @@ public:
         double gear_ratio        = 1.0;
         double rate_hold_s       = 0.12;  ///< 指令停手后开始衰减的延时
         double rate_decay_tau    = 0.05;  ///< 衰减时间常数（越小停得越快）
+        /// 末段软化：速度已经很小、且在往 0 收时，用更缓的斜坡收尾
+        /// （0 = 关闭）。重负载停下来的"顿一下"可以用它压
+        double rate_soft_zone    = 0.0;   ///< 软化区间 °/s
+        double rate_soft_ratio   = 0.4;   ///< 软化后的斜坡比例
         bool   use_soft_limits = true;
         bool   use_limit_switches = true; ///< 联动机驱动板限位输入
     };
