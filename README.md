@@ -60,7 +60,7 @@
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-ctest --test-dir build          # = ./build/gimbal --selftest，纯软件 9 段自检
+ctest --test-dir build          # = ./build/gimbal --selftest，纯软件 13 段自检
 ```
 
 ### 2.2 典型后端组合
@@ -111,7 +111,7 @@ tail -f /tmp/gimbal.log        # 看日志
 
 ## 3. 目录结构
 
-**31 个源文件（17 头 + 14 源）/ 6829 行**，另加 `CMakeLists.txt`、`README.md` 与 `src/device/fire_worker.py`。
+**31 个源文件（17 头 + 14 源）/ 7017 行**，另加 `CMakeLists.txt`、`README.md` 与 `src/device/fire_worker.py`。
 
 ```
 gimbal/
@@ -168,11 +168,11 @@ gimbal/
 ```
 
 行数分布（判断改动影响面用）：
-`main.cpp` 2046 · `unified_serial.cpp` 356 · `mjpeg_server.cpp` 401 · `can_chassis_link.cpp` 278 ·
+`main.cpp` 2222 · `unified_serial.cpp` 356 · `mjpeg_server.cpp` 401 · `can_chassis_link.cpp` 278 ·
 `zdt_motor.cpp` 243 · `zdt_frame.cpp` 200 · `can_transport.cpp` 179 · `udp_control_link.cpp` 175 ·
-`axis.cpp` 153 · `imu_i2c.cpp` 171 · `gimbal.cpp` 111 · `imu_pitch.cpp` 81 · `itransport.cpp` 77 · `fire_control.cpp` 76 ·
-头文件：`control_link.hpp` 347 · `fake_transport.hpp` 204 · `chassis_link.hpp` 194 · `unified_serial.hpp` 146 ·
-`zdt_motor.hpp` 134 · `can_chassis_link.hpp` 121 · `zdt_codes.hpp` 104 · `zdt_frame.hpp` 97 · `axis.hpp` 94 ·
+`axis.cpp` 171 · `imu_i2c.cpp` 171 · `gimbal.cpp` 111 · `imu_pitch.cpp` 81 · `itransport.cpp` 77 · `fire_control.cpp` 76 ·
+头文件：`control_link.hpp` 347 · `fire_link.hpp` 303 · `fake_transport.hpp` 204 · `chassis_link.hpp` 194 · `unified_serial.hpp` 146 ·
+`zdt_motor.hpp` 134 · `can_chassis_link.hpp` 121 · `zdt_codes.hpp` 104 · `zdt_frame.hpp` 97 · `axis.hpp` 101 ·
 `itransport.hpp` 91 · `gimbal.hpp` 89 · `imu.hpp` 86 · `udp_control_link.hpp` 75 · `imu_i2c.hpp` 58 · `can_transport.hpp` 61 · `fire_control.hpp` 31。
 
 > ★ = 协议/接口的关键文件，改动要三端（固件 ↔ Jetson ↔ PC 客户端）同步。
@@ -368,7 +368,7 @@ Jetson CH340 RX ←── F407 USART2_TX + ZDT yaw TX + ZDT pitch TX   （三机
 
 ## 7. 自检覆盖范围（`--selftest` / `ctest`）
 
-`--selftest` 不需要任何硬件，共 **9 段**：
+`--selftest` 不需要任何硬件，共 **13 段**：
 
 | 段 | 验证内容 |
 |---|---|
@@ -381,6 +381,10 @@ Jetson CH340 RX ←── F407 USART2_TX + ZDT yaw TX + ZDT pitch TX   （三机
 | [7] 单总线帧分流 | `RxDemux` 半包/逐字节喂入、底盘帧 + ZDT 帧交错、垃圾字节、无坏帧 |
 | [8] CAN 反馈组拼装 | `CanFbGroup`：0x110~0x114 顺序/乱序/缺帧/CRC 坏组/非反馈帧 |
 | [9] 混合传输 | yaw 走 CAN、pitch 走 UART（两轴不同总线），命令/回读各自落在正确总线 |
+| [10] pitch 会话状态机 | 纯软件（FakeTransport 模拟电机运动）：会话开始→抬升→定零→断流放下→锁死 |
+| [11] 起停手感 | 指令流台阶：每帧 ≤1 RPM、单调不回头 |
+| [12] IMU 俯仰融合 | 互补滤波 + 创新门限：静态精度、动态跟踪、线性加速度门限 |
+| [13] 绝对仰角保持 | FakeTransport + 手构造 IMU 角度，验证底盘倾斜补偿 |
 
 ---
 
@@ -489,6 +493,94 @@ vx_mmps / vy_mmps / wz_mradps / chassis_flags / chk2（14~20 XOR）/ pad
 
 ---
 
+## 8.5 pitch 轴整条链路（会话 / 零位 / 限位 / 手感 / IMU / 打滑）
+
+**一句话**：PC 首包 → 抬到工作位并定为 0° → 方向键速率控制（软限位 ±30°）→ 断流/退出 → 放下到 −40° 抱死。
+
+**0° 一旦建立就固定**：之后每次会话是"回到这个 0°"，而不是再抬 50°——否则零点每轮爬升 +10°，几轮后枪口贴到限位，表现成"向上抬不动、向下能动"。
+
+```
+gimbal_ctl ──UDP 40001──► main.cpp 100Hz ──► PitchSession 状态机 ──► Axis（斜坡/限位）
+                                                                    └─► ZdtMotor ──CAN 扩展帧──► ZDT 驱动板 ──► 电机 ──► 枪口
+                                                                                                        └─► IMU(ICM-42688-P, I²C) ──► 绝对仰角 / 打滑检测
+```
+
+### 8.5.1 会话状态机（`PitchSession`，`src/main.cpp`）
+
+| 状态 | 行为 | 进入 | 离开 |
+|---|---|---|---|
+| `Locked` | 速率 0、保持使能；IMU 在线时先等零偏标定（约 2 s） | 启动 / 急停 / 放下完成 | 收到合法 UDP 包且就绪 → `Raising` |
+| `Raising` | P 伺服抬到目标（≤60 °/s）；到点把该姿态定为 0°（`zeroHere`），IMU 同步清零 | 会话开始 | 到位（±1.5°）→ `Active`；**打滑 / 堵转 / 1 s 无位移 / 8 s 超时 → 中止并锁死** |
+| `Active` | PC 速率直通（`--pitch-abs` 时为绝对仰角伺服） | 抬升到位 | 0.5 s（`--pitch-session-end`）无包 → `Lowering`；急停 → `Locked` + latch |
+| `Lowering` | P 伺服放下到 `--pitch-lower`（默认 −40°），下限不越过会话起点 | 控制结束 | 到位 → `Locked`；控制端回来 → 回 `Active`；堵转/超时 → 停住抱死 |
+
+- **首次 vs 之后**：同一进程内第一次会话是"抬 `--pitch-rise`（默认 50°）并定 0°"；之后每次会话是"回到已建立的 0°"（`have_zero_`），零点不再漂；
+- **急停**：`x` 立即停止 + 失能并 **latch**，需按 `g` 关再开（或本地 `en 1`）重新授权；
+- **退出**：Ctrl-C / `q` 先放下（最多 6 s）再保持使能抱死；
+- **重定零**：重启 daemon 后首次会话会重新抬 50° 定零。
+
+### 8.5.2 零位、软限位与机械行程（三层，机械优先）
+
+| 层 | 参数 | 默认 | 作用 |
+|---|---|---|---|
+| 抬升 | `--pitch-rise` | **50°** | 首次会话从当前位抬多少并定为 0° |
+| 抬升微调 | `--pitch-rise-extra` | 0° | 在 50° 基础上再加减 |
+| 软限位 | `--pitch-limit` | **−30 30** | 0° 上下允许的操作范围 |
+| 机械行程 | `--pitch-mech-travel` | **85°** | 相对会话起点最多能抬多少：抬升目标与软限位上界都被它夹住，贴近边缘会打警告 |
+| 放下 | `--pitch-lower` | **−40°** | 断流/退出后放到的角度（夹在 `[会话起点, 0°]` 内） |
+
+- 软限位到位后自动收进机械窗口：`hi = min(pitch_max, mech_travel − 抬升行程)`，`lo = max(−pitch_max, −抬升行程)`；
+- 放下**没有** −5° 余量（过去会往机械下止点顶）；
+- 抬升目标超出行程会被截断并打日志。
+
+### 8.5.3 手感参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--yaw-ramp` / `--pitch-ramp` | 600 °/s² | 角加速度（0→120 约 0.2 s） |
+| `--hold-delay` / `--hold-tau` | 0.12 s / 0.05 s | 停手后衰减 |
+| `--deadband` | 0.5 °/s | 速度死区 |
+| `--soft-zone` / `--soft-ratio` | 0（关）/ 0.4 | 末段软化：速度很小且往 0 收时用更缓斜坡收尾（重负载停抖可试 8~12 / 0.3） |
+| `--acc` | 200 | 驱动板加速度档位（每 RPM 2.8 ms；调小更柔） |
+| `--tx-gap` | 8 ms | ZDT 命令最小间隔；速度帧按电机"合并 + 插队"，饱和时执行最新指令 |
+| `--damp-k` | 0（关） | 主动阻尼：用 IMU 角速度压停车振铃（0.4~0.6 可试），只在用户没给指令时生效 |
+| 客户端 `--tau` | 0.045 s | 方向键低通（越小越跟手、越大越丝滑） |
+
+> 速度帧是**整数 RPM**：pitch 直连 1 RPM = 6°/s，最小非零速度就是 6°/s；台阶均匀（每帧 1 RPM）。
+> 12 ms 节流下总线会被"速度帧 + 遥测轮询"挤满，所以速度帧必须合并+插队，否则会执行旧指令、起停顿挫。
+
+### 8.5.4 IMU（ICM-42688-P，I²C）在 pitch 上的三个用途
+
+1. **同步清零**：抬升到位时把 IMU 清零，让 IMU 的 0° 与编码器的 0° 一致；
+2. **主动阻尼**（`--damp-k`）：压停车振铃；
+3. **绝对仰角保持**（`--pitch-abs`）：方向键速率积分成目标仰角、用 IMU 闭环保持（底盘倾斜补偿）。
+   该模式天然是"动编码器、让 IMU 不动"，所以**打滑检测在此模式下关闭**。
+
+零偏：开机自动标定（2 s 窗口、σ<1.5 °/s，运动中自动重来），也可 `--imu-gyro-bias` 手动指定。
+
+### 8.5.5 打滑检测（联轴器）
+
+运动时比较**编码器增量**与 **IMU 增量**（0.5 s 窗口，est 至少动 2°），比值 > 1.6 判定打滑：
+
+- `Raising` 阶段**中止并锁死**（日志：`疑似联轴器打滑（电机在转、枪口没跟上）`）；
+- `Active` 阶段只打一次警告；
+- `--pitch-abs` 绝对保持模式下不判断。
+
+实测案例：电机 10 RPM（60 °/s）、编码器 65 °/s，而枪口 IMU 只有 25 °/s —— 联轴器持续打滑；
+检测立即中止，避免把 est 推到 50° 后"上报成功"。
+
+### 8.5.6 排障速查
+
+| 现象 | 先查什么 |
+|---|---|
+| 向上抬不动、向下能动 | est 是否顶到 +30° 软限位（状态里 `[限位]`）；零点是否在爬升（必须同一 daemon 进程内复用 0°）；机械上止点 |
+| 抬升"只抬一点点" | 打滑检测是否中止；电机实测 RPM 与 IMU 角速度是否一致 |
+| 抬完抖一下 | 负载惯量引起的 3~5 Hz 振铃，试 `--soft-zone/--soft-ratio`、`--pitch-ramp`、`--damp-k`、`--acc` |
+| IMU 偶发读数全 0 | 模块 AD0 悬空导致 0x68/0x69 跳变（daemon 5 s 重连兜底） |
+| 放下后零点越来越高 | 确认在同一 daemon 进程内测试；重启 daemon 会重新抬 50° 定零 |
+
+---
+
 ## 9. 水弹波箱火力（可选）
 
 gimbal 不直接驱动 MOS，而是 fork 一个 Python worker，用 `Jetson.GPIO` 的 BOARD 模式管子：
@@ -522,6 +614,20 @@ gimbal_ctl 按住 F ──UDP Fire 位(0x80)──► gimbal ──管道 "1\n"/
 | `--yaw-rate` | 180 | yaw 最大 °/s | `--fire-pin` | 12 | 火力 GPIO（BOARD 号） |
 | `--pitch-rate` | 120 | pitch 最大 °/s | `--no-fire` | off | 不启动火力进程 |
 | `--selftest` | off | 自检后退出 | `-h` / `--help` | — | 打印用法 |
+| `--pitch-session-end` | 0.5 s | 断流多久算控制结束 | `--no-pitch-session` | off | 关闭 pitch 会话（速率直通） |
+| `--pitch-rise` | **50** | 首次会话抬升并定 0° | `--pitch-rise-extra` | 0 | 在 50° 上再微调 |
+| `--pitch-rise-rate` | 60 | 抬升/放下最大 °/s | `--pitch-servo-kp` | 2.0 | 抬升 P 增益 |
+| `--pitch-servo-tol` | 1.5 | 到位容差 ° | `--pitch-raise-timeout` | 8 s | 过渡超时 |
+| `--pitch-mech-travel` | **85** | 机械行程（相对会话起点） | `--pitch-lower` | **−40** | 放下目标角 |
+| `--soft-zone` / `--soft-ratio` | 0 / 0.4 | 末段软化 | `--damp-k` | 0 | 主动阻尼 |
+| `--tx-gap` | 8 ms | ZDT 命令间隔 | `--yaw-ramp` / `--pitch-ramp` | 600 | 角加速度 °/s² |
+| `--hold-delay` / `--hold-tau` | 0.12 / 0.05 | 停手衰减 | `--deadband` | 0.5 | 死区 °/s |
+| `--pitch-abs` | off | 绝对仰角保持 | `--abs-kp` | 3.0 | 绝对伺服 P 增益 |
+| `--imu <dev>` | 空 | 启用 IMU（如 `/dev/i2c-1`） | `--imu-addr` | 0x68 | 地址（自动识别 0x68/0x69） |
+| `--imu-gyro-axis <x\|y\|z>` | z | 俯仰转轴对应的陀螺轴 | `--imu-invert` | off | 方向翻转 |
+| `--imu-offset` | 0° | 安装偏置 | `--imu-alpha` | 0.98 | 互补滤波系数 |
+| `--imu-gyro-bias` | 0（自动标定） | 陀螺零偏 °/s | `--imu-log <文件>` | — | IMU 逐帧记录（调抖动/标定用） |
+| `--imu-probe` | off | 只读 IMU 打印后退出 | | | |
 
 **本地 stdin 命令**（一行一条）：
 
@@ -853,3 +959,4 @@ IMU 约一半的读在**地址字节**就被 NACK（`us≈27 µs`，不是 3 ms 
 | 2026-10-19 | 单串口统一链路（`UnifiedSerial` 合并底盘 + 云台）、无线 AP、客户端英文化、UDP 协议升 v2（24 B/64 B 含底盘字段）、IMU「一卡一卡」修复（§12.3） |
 | 2026-10-21 | 新增 CAN 底盘链路（`CanChassisLink` + `CanFbGroup`）、`--yaw-can` / `--no-udp` 参数、自检补 [8][9]；文档同步到当前代码 |
 | 2026-11-05 | **三份文档合并为本 README**（原 `CHASSIS_LINK.md` / `DEBUG_REPORT_2026-10-19.md` 已并入并删除）；顺带修正过期内容：`--dry` / `--chassis-dev` / `--chassis-baud` 等已移除参数、电机地址 yaw=1/pitch=2、pitch 直连 1:1 与 ±30° 限位、客户端按键 `g`/`j`/`F`、补水弹波箱与环境 GPIO 火力说明、补 `fire_control` 相关文件到目录树 |
+| 2026-11-07 | **pitch 会话整条链路完善**：0° 一次建立后固定（`have_zero_`，不再每轮爬升）；新增 `--pitch-rise-extra` / `--pitch-mech-travel` / `--pitch-lower` / `--soft-zone` / `--soft-ratio` / `--damp-k` / `--imu-log`；打滑检测（编码器 vs IMU 增量）；IMU 零偏只统计安静样本、标定期间会话等待；软限位收进机械行程窗口；自检补 [10]~[13] |
