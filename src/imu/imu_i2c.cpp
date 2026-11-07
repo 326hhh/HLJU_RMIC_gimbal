@@ -8,6 +8,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
@@ -151,7 +152,22 @@ bool Icm42688I2c::readRegs(uint8_t reg, uint8_t* buf, size_t n) {
 bool Icm42688I2c::read(ImuSample* out) {
     if (!out || fd_ < 0) return false;
     uint8_t b[14];
-    if (!readRegs(kRegDataStart, b, sizeof(b))) return false;
+    if (!readRegs(kRegDataStart, b, sizeof(b))) {
+        // AD0 悬空时地址会在 0x68/0x69 之间跳：每 20 次失败重探一次另一个地址
+        if (++probe_fail_ >= 20) {
+            probe_fail_ = 0;
+            if (whoAmI() != kWhoAmICm42688) {
+                const int keep  = cfg_.addr;
+                cfg_.addr = (keep == 0x68) ? 0x69 : 0x68;
+                if (whoAmI() == kWhoAmICm42688) {
+                    std::printf("[imu] 地址自动切换 -> 0x%02X\n", cfg_.addr);
+                } else {
+                    cfg_.addr = keep;
+                }
+            }
+        }
+        return false;
+    }
 
     auto s16 = [](uint8_t hi, uint8_t lo) {
         return static_cast<int16_t>((static_cast<uint16_t>(hi) << 8) | lo);

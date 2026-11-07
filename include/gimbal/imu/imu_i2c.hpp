@@ -53,6 +53,7 @@ private:
     Config      cfg_;
     int         fd_ = -1;
     std::string err_;
+    int         probe_fail_ = 0;   ///< 连续读失败计数（地址重探用）
 };
 
 }  // namespace gimbal

@@ -46,8 +46,7 @@ public:
     };
 
     Axis(std::shared_ptr<ZdtMotor> motor, Config cfg);
-
-    // ---- 操作端接口 ----
+    // ---- 任务接口 ----
     /// 设定角速度指令（°/s，正 = 角度增大）
     void setRate(double dps);
     /// 停止转动（保持使能，抱死）
